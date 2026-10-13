@@ -1,0 +1,2 @@
+cellularity	ploidy	SLPP
+0.3	2	0.0326546525677738

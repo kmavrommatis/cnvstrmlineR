@@ -1,0 +1,128 @@
+url: https://kmavrommatis.github.io/cnvstrmlineR/
+
+template:
+  bootstrap: 5
+
+navbar:
+  structure:
+    left:  [intro, reference, articles]
+    right: [search, github]
+
+# No explicit `articles:` index on purpose. vignettes/mfacets.Rmd is
+# internal-only and is stripped from the public snapshot, so a hardcoded
+# list would break either the internal build (missing entry) or the public
+# one (entry with no matching file). Auto-indexing works for both.
+
+reference:
+  - title: The cnvstrml object
+    contents:
+      - "cnvstrml-class"
+      - "initialize,cnvstrml-method"
+      - "show,cnvstrml-method"
+      - check_cnvstrml
+      - getSeqInfo
+      - seqinfo
+
+  - title: Parsers
+    contents:
+      - starts_with("parse")
+      - predictMethod
+      - predictName
+      - getSupportedMethods
+      - findFile
+      - loadMutationsFromVCF
+      - updateBattenbergClone
+      - updateSCLUSTClone
+
+  - title: Consensus and comparison
+    contents:
+      - ensemblCall
+      - findConsensus
+      - findConsensusGR
+      - applyConsensus
+      - findCommonGR
+      - annotateCommonGR
+      - starts_with("compare")
+      - matchCNVSV
+      - matchBreakpointsOneToOne
+
+  - title: Annotation and segment manipulation
+    contents:
+      - annotateCNV
+      - addCCF
+      - addCCF.cnvstrml
+      - addCCF.numeric
+      - addLOH
+      - addChromosomeAnnotation
+      - addChromosomeAnnotation.GRanges
+      - addChromosomeAnnotation.cnvstrml
+      - adjustLogR
+      - adjustPloidy
+      - mergeSegments
+      - fillGaps
+      - fillGaps.GRanges
+      - fillGaps.cnvstrml
+      - createMask
+      - applyMask
+      - removeKnownGaps
+      - loadCentromere
+      - filterLowQualitySegments
+
+  - title: Purity, ploidy and sex
+    contents:
+      - getPurity
+      - getPloidy
+      - calculateEffectivePloidy
+      - getSex
+      - inferSex
+
+  - title: Quality control and metrics
+    contents:
+      - applyQCMetrics
+      - qcTable
+      - summaryTable
+      - segmentsCNAqc
+      - cnvMetrics
+      - segmentationMetrics
+      - cnvEntropy
+      - CNV_entropy_sample
+      - computeFragmentation
+      - detectOverfragmentation
+      - frequentist_test_fragmentation
+      - starts_with("compute")
+      - starts_with("annotateB")
+      - starts_with("summarise")
+      - starts_with("get")
+      - starts_with("assign")
+      - scoreNullCaller
+
+  - title: Export
+    contents:
+      - saveSEG
+      - exportGISTIC
+      - writeVCF
+      - writemFACETSVCF
+      - make_header_mFACETS
+      - recordToVcf_mFACETS
+      - savePhyloWGS
+      - saveAnnotSV
+      - recordToVcf
+      - make_header
+
+  - title: Visualisation
+    contents:
+      - starts_with("plot")
+
+  - title: Data
+    contents:
+      - chrom_annot
+      - chrom_arms
+      - chrom_gaps
+      - chrom_size
+
+  - title: Package
+    contents:
+      - "cnvstrmliner-package"
+      - "cnvstrmliner-imports"
+      - "cnvstrmliner-overview"
+      - "%>%"

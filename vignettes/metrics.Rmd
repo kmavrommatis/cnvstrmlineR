@@ -1,0 +1,2769 @@
+---
+title: "Comparing CNV segmentations: a guided tour of the metrics"
+author:
+- name: Konstantinos Mavrommatis
+  affiliation: Bristol Myers Squibb
+  email: konstantinos.mavrommatis@bms.com
+package: cnvstrmliner
+output:
+  BiocStyle::html_document:
+    toc_float: true
+    code_folding: show
+    fig_caption: true
+abstract: |
+  A segmentation makes two independent claims about a genome -- where the
+  transitions are, and what the levels between them are -- and no single
+  agreement number can say which of the two a caller got wrong. This vignette
+  works through the comparison functions of `cnvstrmliner` on a synthetic
+  chromosome with a known truth and four callers that each fail in a different
+  way: state agreement and its chance-corrected forms, event recall and
+  precision, breakpoint and structural agreement, per-segment concordance,
+  truth-free consensus scores, and the information criteria. Each metric is
+  shown together with the failure mode it cannot see.
+vignette: |
+  %\VignetteIndexEntry{Comparing CNV segmentations: a guided tour of the metrics}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE,
+  warning = FALSE,
+  crop = NULL,
+  fig.width = 9,
+  fig.height = 4.8,
+  dpi = 150,
+  out.width = "100%",
+  fig.align = "center"
+)
+```
+
+```{r setup, message = FALSE}
+library(cnvstrmliner)
+library(GenomicRanges)
+library(S4Vectors)
+library(ggplot2)
+library(dplyr)
+
+# The cnvstrml constructor is chatty at INFO level; keep the vignette readable.
+logger::log_threshold(logger::WARN)
+```
+
+# Why this vignette exists
+
+Once two CNV callers have been run over the same sample -- or the same caller
+twice with different settings, or a caller against a simulated ground truth --
+the obvious question is *how much do they agree?* The obvious answer, "count the
+fraction of the genome where they say the same thing", is not a well defined one, and the
+whole of this vignette is really an unpacking of why.
+
+A segmentation makes two separate claims about a genome:
+
+1. **Where the transitions are.** Where does one copy-number level stop and the
+   next begin?
+2. **What the levels are.** Is this piece amplified, deleted, or unchanged?
+
+A caller can get one right and the other wrong, in either direction, and a
+single agreement number cannot say which happened. Worse, most genomes are
+mostly neutral, so a caller that reports *nothing at all* already agrees with
+the truth over most of the genome. Any metric that gives that caller a good
+score is measuring the composition of the sample, not the skill of the caller.
+
+The functions described here are built around those two problems. They split the
+"where" question from the "what" question, and every one of them is either
+chance-corrected by construction or shipped with a companion that reports what
+the do-nothing score would have been.
+
+Each section below follows the same shape: what the metric measures, a picture
+of the intuition, the code, when to reach for it, and what it leaves unanswered.
+
+The tour runs in the order these are actually applied:
+
+* **Part 1** -- is the bin-level data good enough to segment at all?
+* **Parts 2 and 3** -- against a known truth, did the caller get the *levels*
+  right, and did it get the *transitions* right?
+* **Part 4** -- which of its individual segments can be believed?
+* **Part 5** -- with no truth, what can a family of callers reveal about each
+  other?
+* **Part 6** -- whole-profile comparison in base pairs, on `cnvstrml` objects.
+* **Part 7** -- picking among settings of one caller with information criteria.
+* **Part 8** -- the rollups, and the single call that runs most of the above.
+
+Parts 6 and 7 each end with a worked example of the metric preferring a caller
+known to be the worst of the four. Those are the two most useful pages here.
+
+# A worked example to measure
+
+Everything in this vignette is computed on one small synthetic chromosome, so
+that every number can be checked by eye against the picture.
+
+## The reference and four callers
+
+```{r toy-data}
+makeSegmentation <- function(boundaries, states, chr = "chr1") {
+  GRanges(
+    seqnames = chr,
+    ranges = IRanges(
+      start = head(boundaries, -1) + 1,
+      end = tail(boundaries, -1)
+    ),
+    cnv.annotation = states
+  )
+}
+
+Mb <- 1e6
+
+reference <- makeSegmentation(
+  boundaries = c(0, 7, 13, 19, 23, 30) * Mb,
+  states     = c("NEUT", "AMP", "NEUT", "HETDEL", "NEUT")
+)
+
+accurate <- makeSegmentation(
+  boundaries = c(0, 7.25, 12.80, 19.15, 22.80, 30) * Mb,
+  states     = c("NEUT", "AMP", "NEUT", "HETDEL", "NEUT")
+)
+
+fragmented <- makeSegmentation(
+  boundaries = c(
+    0, 3.4, 7.1, 9.2, 9.9, 12.9, 15.5,
+    19.1, 21.0, 22.9, 26.2, 30
+  ) * Mb,
+  states = c(
+    "NEUT", "NEUT", "AMP", "NEUT", "AMP", "NEUT",
+    "NEUT", "HETDEL", "HETDEL", "NEUT", "NEUT"
+  )
+)
+
+conservative <- makeSegmentation(
+  boundaries = c(0, 8.5, 11.5, 30) * Mb,
+  states     = c("NEUT", "AMP", "NEUT")
+)
+
+shifted <- makeSegmentation(
+  boundaries = c(0, 5.4, 11.3, 20.6, 24.4, 30) * Mb,
+  states     = c("NEUT", "AMP", "NEUT", "HETDEL", "NEUT")
+)
+
+callers <- list(
+  "Accurate caller"     = accurate,
+  "Fragmented caller"   = fragmented,
+  "Conservative caller" = conservative,
+  "Shifted caller"      = shifted
+)
+```
+
+The four callers are caricatures, each exaggerating one realistic failure mode:
+
+* **Accurate caller** -- finds both events, with boundaries a couple of hundred
+  kilobases off. This is what a good result looks like.
+* **Fragmented caller** -- finds both events but chops them into pieces, and
+  inserts a spurious neutral gap in the middle of the amplification.
+  Over-segmentation.
+* **Conservative caller** -- reports a smaller amplification and misses the
+  deletion entirely. Under-calling.
+* **Shifted caller** -- reports exactly the right *events* but places every
+  boundary one to two megabases away. Right biology, wrong coordinates.
+
+## The evidence grid
+
+Every bin-level metric in the package needs to be told **where the assay could
+see anything**. On whole-genome data that is the whole genome and a uniform
+tiling is fine. On a capture panel it is the target regions, and this matters a
+great deal: tiling a whole-exome sample uniformly puts most tiles in
+unsequenced intergenic space where no caller had evidence, which ends up
+measuring agreement over territory nobody looked at.
+
+This toy assay is a capture panel: 100 kb targets every 200 kb, with a two
+megabase capture desert between 15 and 17 Mb.
+
+```{r targets}
+target_starts <- seq(1, 30 * Mb, by = 0.2 * Mb)
+targets <- GRanges(
+  seqnames = "chr1",
+  ranges   = IRanges(start = target_starts, width = 0.1 * Mb)
+)
+targets <- targets[!(start(targets) > 15 * Mb & end(targets) < 17 * Mb)]
+
+length(targets)
+```
+
+## The same segmentations as `cnvstrml` objects
+
+The bin-level metrics in Parts 2 to 5 accept bare `GRanges`, which is why the
+toy data above is enough for them. A second group of metrics -- the whole-profile
+comparisons of Part 6 -- works on `cnvstrml` objects instead, because they read
+allele copy numbers and log-ratios rather than just a state label.
+
+Promoting the toy segmentations, they are `cnvstrml` objects that require
+`total.allele.copies`, `major.allele.copies`, `minor.allele.copies`, `cnv.lrr`,
+`cnv.markers`, `cnv.totalmarkers` and `cnv.cf` on its segments, so a consistent
+set is invented from each state label.
+
+```{r cnvstrml-objects}
+state_cn <- data.frame(
+  cnv.annotation      = c("NEUT", "AMP", "HETDEL", "HOMDEL"),
+  total.allele.copies = c(2, 4, 1, 0),
+  major.allele.copies = c(1, 3, 1, 0),
+  minor.allele.copies = c(1, 1, 0, 0),
+  cnv.lrr             = c(0, 1.0, -1.0, -3.0)
+)
+
+asCnvstrml <- function(gr, method) {
+  i <- match(gr$cnv.annotation, state_cn$cnv.annotation)
+  mcols(gr) <- cbind(mcols(gr), state_cn[i, -1, drop = FALSE])
+  gr$cnv.markers <- pmax(1, round(width(gr) / 2e5))
+  gr$cnv.totalmarkers <- gr$cnv.markers
+  gr$cnv.cf <- 1
+  new("cnvstrml",
+    segments = gr, sample = "toy", method = method,
+    genome = "hg38", sex = "XX", purity = 0.8, ploidy = 2
+  )
+}
+
+reference_obj <- asCnvstrml(reference, "reference")
+caller_objs <- mapply(asCnvstrml, callers, names(callers))
+```
+
+## Bin-level log-ratio data
+
+The input-quality metrics of Part 1 and the information criteria of Part 7 never
+look at segments alone -- they need the per-bin log-ratios the segmentation was
+fitted to. The chunk below simulates a `.cnr`-style table: bins of 100 kb,
+drawn around the true state mean with a realistic amount of noise. This is
+typically a file obtained by running CNVkit on a pair or tumor - matched normal
+or a tumor - PON set.
+
+```{r bin-data}
+set.seed(42)
+
+bins <- GRanges(
+  seqnames = "chr1",
+  ranges   = IRanges(start = seq(1, 30 * Mb, by = 1e5), width = 1e5)
+)
+
+state_mean <- c(NEUT = 0, AMP = 0.9, HETDEL = -0.85)
+true_state <- assignBinState(bins, reference)
+mu <- state_mean[true_state]
+mu[is.na(mu)] <- 0
+
+bins$log2 <- rnorm(length(bins), mean = mu, sd = 0.18)
+bins$weight <- 1
+
+cnr <- data.frame(
+  chromosome = as.character(seqnames(bins)),
+  start      = start(bins),
+  log2       = bins$log2,
+  depth      = pmax(1, rnbinom(length(bins), mu = 120, size = 8))
+)
+
+head(cnr, 3)
+```
+
+## Plotting helpers
+
+These are only for the figures in this vignette; they are not part of the
+package.
+
+```{r plot-helpers}
+state_colours <- c(
+  NEUT   = "grey82",
+  AMP    = "#D7301F",
+  HETDEL = "#2B8CBE",
+  HOMDEL = "#08306B"
+)
+
+theme_slide <- function(base_size = 15) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_blank(),
+      # Titles here are full sentences; at the default title size (1.2 * base_size)
+      # the longer ones run past the edge of the device and get clipped. Shrinking
+      # them relative to the base size, and letting the title span the whole plot
+      # rather than only the panel, keeps them readable and complete.
+      plot.title.position = "plot",
+      plot.title = element_text(face = "bold", size = rel(0.85)),
+      plot.subtitle = element_text(colour = "grey30", size = rel(0.75)),
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      axis.title.y = element_blank()
+    )
+}
+
+trackFrame <- function(track_list) {
+  rows <- lapply(names(track_list), function(nm) {
+    d <- as.data.frame(track_list[[nm]])
+    d$Segmentation <- nm
+    d
+  })
+  d <- dplyr::bind_rows(rows)
+  d$Segmentation <- factor(d$Segmentation, levels = rev(names(track_list)))
+  d$row <- as.numeric(d$Segmentation)
+  d
+}
+
+plotTracks <- function(track_list, title = NULL, subtitle = NULL) {
+  d <- trackFrame(track_list)
+  ggplot(d) +
+    geom_rect(
+      aes(
+        xmin = start / Mb, xmax = end / Mb,
+        ymin = row - 0.36, ymax = row + 0.36,
+        fill = cnv.annotation
+      ),
+      colour = "white", linewidth = 0.4
+    ) +
+    scale_fill_manual(values = state_colours) +
+    scale_y_continuous(
+      breaks = seq_along(levels(d$Segmentation)),
+      labels = levels(d$Segmentation)
+    ) +
+    labs(title = title, subtitle = subtitle, x = "Position on chr1 (Mb)") +
+    theme_slide()
+}
+```
+
+Part 4 reuses the track layout of Figure 1, but with the segments shaded by a
+per-segment score rather than by state. That needs two colour scales in one
+picture, so those figures are two aligned panels stacked with `r CRANpkg("patchwork")`: the
+reference states on top, the scored segmentations underneath.
+
+```{r plot-helpers-scored}
+library(patchwork)
+
+xlim_chr <- scale_x_continuous(limits = c(0, 30), expand = c(0.01, 0))
+
+# Track figures carry wide y-axis labels, which push the panel -- and with it the
+# left-aligned title -- to the right. Wrap long captions so they are not clipped.
+wrapSub <- function(x, width = 62) {
+  if (is.null(x)) {
+    return(NULL)
+  }
+  paste(strwrap(x, width = width), collapse = "\n")
+}
+
+refPanel <- function(title = NULL, subtitle = NULL) {
+  plotTracks(list("Reference truth" = reference),
+    title = title, subtitle = wrapSub(subtitle)
+  ) +
+    xlim_chr + labs(x = NULL) +
+    # The state colour code is already established by Figure 1, and a legend here
+    # would sit between the two panels and break them apart.
+    theme(
+      legend.position = "none",
+      axis.text.x = element_blank(), plot.margin = margin(b = 2)
+    )
+}
+
+scorePanel <- function(scored_list, score_col, score_name) {
+  d <- dplyr::bind_rows(lapply(names(scored_list), function(nm) {
+    x <- as.data.frame(scored_list[[nm]])
+    x$score <- mcols(scored_list[[nm]])[[score_col]]
+    x$Segmentation <- nm
+    x[, c("start", "end", "score", "Segmentation")]
+  }))
+  d$Segmentation <- factor(d$Segmentation, levels = rev(names(scored_list)))
+  d$row <- as.numeric(d$Segmentation)
+
+  ggplot(d) +
+    geom_rect(
+      aes(
+        xmin = start / Mb, xmax = end / Mb,
+        ymin = row - 0.36, ymax = row + 0.36, fill = score
+      ),
+      colour = "white", linewidth = 0.4
+    ) +
+    scale_fill_gradient2(
+      low = "#D7301F", mid = "#FEE08B", high = "#1A9850",
+      midpoint = 0.5, limits = c(0, 1),
+      name = score_name, na.value = "grey92"
+    ) +
+    scale_y_continuous(
+      breaks = seq_along(levels(d$Segmentation)),
+      labels = levels(d$Segmentation)
+    ) +
+    xlim_chr +
+    labs(x = "Position on chr1 (Mb)") +
+    theme_slide() +
+    guides(fill = guide_colourbar(
+      title.position = "top", title.hjust = 0.5,
+      barwidth = grid::unit(12, "lines"),
+      barheight = grid::unit(0.7, "lines")
+    )) +
+    theme(legend.title = element_text(), plot.margin = margin(t = 2))
+}
+
+scoredTrackFigure <- function(scored_list, score_col, score_name,
+                              title = NULL, subtitle = NULL) {
+  refPanel(title, subtitle) /
+    scorePanel(scored_list, score_col, score_name) +
+    plot_layout(heights = c(1, length(scored_list) * 0.95))
+}
+```
+
+```{r fig-overview, fig.height = 5.2, fig.cap = "The reference segmentation and the four callers scored throughout this vignette."}
+plotTracks(
+  c(list("Reference truth" = reference), callers),
+  title = "One chromosome, one truth, four ways to get it wrong",
+  subtitle = "Red = amplification, blue = heterozygous deletion, grey = neutral"
+)
+```
+
+# Part 1 -- Is the input good enough to segment at all?
+
+Every metric in Parts 2 to 8 compares segmentations. None of them can reveal
+that the *data* was too noisy to segment in the first place -- a caller handed
+unusable bins will produce a segmentation, and two callers handed the same
+unusable bins will often agree with each other about it.
+
+The two functions here look at the bin-level signal directly, before any
+segmentation exists. They take a plain data frame rather than a `cnvstrml`
+object, because they are meant to run on a caller's raw bin output (a CNVkit
+`.cnr` file, for instance).
+
+## `computeMAPD()` -- how noisy are the bins?
+
+### What it measures
+
+The median absolute difference between *adjacent* bins, within each chromosome.
+Because neighbouring bins almost always belong to the same copy-number segment,
+their true difference is zero nearly everywhere; whatever difference is
+observed is technical noise. Taking the median rather than the mean is what stops
+the handful of real transitions from inflating the estimate.
+
+Lower is better. MAPD is the standard first-pass quality gate for array and
+capture copy-number data, and the number a caller's own defaults are usually
+tuned against.
+
+### Intuition
+
+```{r fig-mapd, fig.height = 4.6, fig.cap = "Two samples with the same underlying copy-number profile. MAPD measures the bin-to-bin scatter, which is what makes the second one unsegmentable, and ignores the two real transitions."}
+noisy <- cnr
+noisy$log2 <- rnorm(nrow(cnr), mean = mu, sd = 0.55)
+
+mapd_frame <- dplyr::bind_rows(
+  transform(cnr, Sample = sprintf("Clean  (MAPD = %.3f)", computeMAPD(cnr))),
+  transform(noisy, Sample = sprintf("Noisy  (MAPD = %.3f)", computeMAPD(noisy)))
+)
+
+ggplot(mapd_frame, aes(x = start / Mb, y = log2)) +
+  geom_point(size = 0.7, colour = "grey35", alpha = 0.8) +
+  geom_vline(
+    xintercept = c(7, 13, 19, 23), linetype = "dashed",
+    colour = "#2B8CBE", linewidth = 0.6
+  ) +
+  facet_wrap(~Sample, ncol = 1) +
+  labs(
+    title = "The same profile, three times the noise",
+    subtitle = wrapSub("Blue dashed lines are the true transitions. MAPD does not count them."),
+    x = "Position on chr1 (Mb)", y = "Bin log ratio"
+  ) +
+  theme_slide() +
+  theme(axis.title.y = element_text(angle = 90))
+```
+
+### How to use it
+
+```{r mapd-use}
+computeMAPD(cnr)
+computeMAPD(noisy)
+```
+
+The input must be a data frame with a `chromosome` column and either `log2`
+(the default, `use_log = TRUE`) or `depth` (`use_log = FALSE`). Grouping by
+`chromosome` matters: without it, the last bin of one chromosome is differenced
+against the first bin of the next, which manufactures a large artificial jump
+per chromosome.
+
+### When to use it
+
+As a gate, before anything downstream is trusted. A sample whose MAPD is far
+above the cohort median will over-segment under any caller and any setting, and
+no amount of comparison metric will fix that -- it is a sequencing problem, not
+a segmentation problem.
+
+### Advantages and limitations
+
+* Needs no truth, no segmentation, and no reference sample.
+* Insensitive to real copy-number changes, which is what makes it a noise
+  measure rather than a complexity measure.
+* But it is scale-dependent: MAPD on log-ratios and MAPD on raw depths are not
+  comparable, and neither is comparable across bin sizes. Fix the bin width
+  before comparing samples.
+* It says nothing about *where* the noise is. A sample can have an acceptable
+  global MAPD and one catastrophically noisy chromosome.
+
+## `computeGini()` -- how uneven is the coverage?
+
+### What it measures
+
+The Gini coefficient of the coverage distribution across bins: 0 means every bin
+was sequenced to exactly the same depth, and values approaching 1 mean the reads
+piled into a small fraction of the bins. It is the same statistic used for
+income inequality, applied to depth.
+
+MAPD and Gini fail on different samples. MAPD catches *noisy* data; Gini catches
+*unevenly captured* data, where some targets are deep enough to call and others
+have almost no reads. A capture panel with poor uniformity can have a
+respectable MAPD over the bins that worked.
+
+### Intuition
+
+```{r fig-gini, fig.height = 4.2, fig.cap = "Two coverage distributions with the same mean depth. The Gini coefficient separates them; the mean does not."}
+even <- pmax(1, rnbinom(nrow(cnr), mu = 120, size = 40))
+uneven <- pmax(1, rnbinom(nrow(cnr), mu = 120, size = 0.7))
+
+gini_frame <- dplyr::bind_rows(
+  data.frame(
+    depth = even,
+    Sample = sprintf(
+      "Even    (Gini = %.3f)",
+      computeGini(data.frame(depth = even))
+    )
+  ),
+  data.frame(
+    depth = uneven,
+    Sample = sprintf(
+      "Uneven  (Gini = %.3f)",
+      computeGini(data.frame(depth = uneven))
+    )
+  )
+)
+
+ggplot(gini_frame, aes(x = depth, fill = Sample)) +
+  geom_histogram(bins = 45, colour = "white", linewidth = 0.2) +
+  facet_wrap(~Sample, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = c("#1A9850", "#D7301F")) +
+  labs(
+    title = "Same mean depth, different usable fraction",
+    subtitle = wrapSub("Both distributions average about 120x; only one of them can be called everywhere"),
+    x = "Depth per bin", y = "Bins"
+  ) +
+  theme_slide() +
+  theme(
+    legend.position = "none",
+    axis.title.y = element_text(angle = 90, margin = margin(r = 10))
+  )
+```
+
+### How to use it
+
+```{r gini-use}
+computeGini(cnr)
+```
+
+The default `use_log = FALSE` reads a `depth` column, and that is the option to
+use. `use_log = TRUE` runs the same calculation on the `log2` column, but the
+Gini coefficient is only defined for non-negative quantities and log-ratios are
+routinely negative, so the result is not interpretable as an inequality measure:
+
+```{r gini-log-caution}
+# Runs, but the result is not an inequality coefficient at all: because log
+# ratios are signed, it is not even bounded by 1.
+computeGini(cnr, use_log = TRUE)
+```
+
+A Gini coefficient above 1 is the tell. Use `use_log = FALSE` on depths.
+
+### When to use it
+
+On capture and amplicon panels, alongside MAPD, as part of the same gate. Track
+it across a batch: a jump in Gini usually means a library-prep or hybridisation
+problem, and it will show up here before it shows up in anybody's segment calls.
+
+### Advantages and limitations
+
+* Single, bounded, cohort-comparable number that summarises capture uniformity.
+* Independent of mean depth, so it separates "shallow" from "uneven" -- two
+  problems with completely different remedies.
+* Blind to position, exactly like MAPD. It does not identify *which* targets
+  failed; for that, filter the bins on depth directly.
+* Meaningless on signed input -- see the caution above.
+
+## `computeCoverage()` -- per-target depth from a BAM
+
+### What it measures
+
+Mean read depth over each region of a BED file, read straight from an indexed
+BAM with `bamsignals`. This is the function that produces the `depth` column the
+other two consume, when no caller bin file is already available.
+
+### How to use it
+
+```{r coverage-use, eval = FALSE}
+cov <- computeCoverage(
+  bamfile = "sample.bam",
+  bedfile = "targets.bed"
+)
+
+computeGini(cov)
+computeMAPD(cov, use_log = FALSE)
+```
+
+This chunk is not evaluated -- it needs a real indexed BAM, which the package
+does not ship. The BAM must be coordinate-sorted and indexed, and the BED
+contig names must match the BAM header.
+
+### When to use it
+
+Only when no bin-level output is available to start from. If the caller already
+emits a `.cnr`, `.cnn` or equivalent, use that: it has been corrected for GC and
+target efficiency, and this function has not.
+
+# Part 2 -- Did the caller get the copy number right?
+
+## `assignBinState()` -- the projection everything is built on
+
+### What it does
+
+Every bin-level metric works the same way underneath: each bin is handed to the
+one segment it overlaps most, and inherits that segment's state. Bins that no
+segment covers are `NA`. `assignBinState()` exposes that projection.
+
+### Intuition
+
+```{r fig-assign, fig.height = 4.4, fig.cap = "Each target is coloured by the state of the segment that covers most of it. Targets no segment covers are left blank -- they are never silently treated as neutral."}
+bin_states <- data.frame(
+  start = start(targets),
+  end = end(targets),
+  Truth = assignBinState(targets, reference),
+  Accurate = assignBinState(targets, accurate),
+  Fragmented = assignBinState(targets, fragmented)
+)
+
+bin_long <- tidyr::pivot_longer(
+  bin_states,
+  cols = c("Truth", "Accurate", "Fragmented"),
+  names_to = "Segmentation", values_to = "State"
+)
+bin_long$Segmentation <- factor(bin_long$Segmentation,
+  levels = c("Fragmented", "Accurate", "Truth")
+)
+bin_long$row <- as.numeric(bin_long$Segmentation)
+
+ggplot(bin_long) +
+  geom_rect(
+    aes(
+      xmin = start / Mb, xmax = end / Mb,
+      ymin = row - 0.36, ymax = row + 0.36, fill = State
+    ),
+    colour = NA
+  ) +
+  scale_fill_manual(values = state_colours, na.value = "white") +
+  scale_y_continuous(breaks = 1:3, labels = levels(bin_long$Segmentation)) +
+  labs(
+    title = "A segmentation, projected onto the capture targets",
+    subtitle = "The white stripe at 15-17 Mb is the capture desert: no target, no evidence, no score",
+    x = "Position on chr1 (Mb)"
+  ) +
+  theme_slide()
+```
+
+### How to use it
+
+```{r assign-use}
+truth_states <- assignBinState(targets, reference)
+table(truth_states, useNA = "ifany")
+```
+
+The reason to call it directly is speed. When one reference is scored against
+many segmentations -- a forty-setting parameter sweep, say -- compute the
+reference projection once and hand it to `annotateBinStateConcordance()` through
+its `reference_state` argument instead of letting every comparison recompute it.
+
+### Advantages and limitations
+
+* **Advantage:** one bin, one segment. This makes bin sets true sets, so unions
+  and intersections downstream are honest.
+* **Limitation:** a bin straddling a real transition is forced to one side. Bins
+  much wider than the features of interest will blur them; keep the grid at
+  or below the resolution of the assay.
+
+## `computeStateKappa()` -- chance-corrected state agreement
+
+### What it measures
+
+The single most useful "how good is this call set" number in the package.
+Cohen's kappa compares the state assigned to each bin by the query and by the
+reference, and then subtracts the agreement expected by luck given how
+much of each state each side reports:
+
+$$\kappa = \frac{p_o - p_e}{1 - p_e}$$
+
+where $p_o$ is the observed agreement and $p_e$ the agreement expected if the
+two label sets were thrown down independently.
+
+### Intuition
+
+The point of the correction is visible directly. A caller that labels the whole
+genome neutral agrees with the reference over `r round(100 * mean(assignBinState(targets, reference) == "NEUT", na.rm = TRUE))`%
+of the targets -- a raw agreement that looks like competence and is not. Kappa
+scores that caller at exactly zero.
+
+```{r fig-kappa, fig.height = 4.6, fig.cap = "Raw agreement flatters every caller, including the one that does nothing. Kappa does not."}
+null_score <- scoreNullCaller(reference, bins = targets)
+
+kappa_tbl <- bind_rows(lapply(names(callers), function(nm) {
+  k <- computeStateKappa(callers[[nm]], reference, bins = targets)
+  data.frame(
+    Caller = nm, `Raw agreement` = k$p_o, Kappa = k$kappa,
+    check.names = FALSE
+  )
+}))
+kappa_tbl <- bind_rows(
+  data.frame(
+    Caller = "Do-nothing caller",
+    `Raw agreement` = null_score$null_p_o,
+    Kappa = null_score$null_kappa, check.names = FALSE
+  ),
+  kappa_tbl
+)
+
+kappa_long <- tidyr::pivot_longer(kappa_tbl, -Caller,
+  names_to = "Score", values_to = "Value"
+)
+kappa_long$Caller <- factor(kappa_long$Caller, levels = rev(kappa_tbl$Caller))
+
+ggplot(kappa_long, aes(x = Value, y = Caller, fill = Score)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c("Raw agreement" = "grey70", "Kappa" = "#2B8CBE")) +
+  scale_x_continuous(limits = c(min(0, min(kappa_long$Value)), 1)) +
+  labs(
+    title = "Why raw agreement is not a quality score",
+    subtitle = "The do-nothing caller earns a high raw agreement and a kappa of zero",
+    x = "Score"
+  ) +
+  theme_slide()
+```
+
+### How to use it
+
+```{r kappa-use}
+k <- computeStateKappa(accurate, reference, bins = targets)
+k$kappa
+k$n_bins_scored
+k$n_bins_unscored
+head(k$marginals)
+```
+
+`marginals` is worth looking at whenever a kappa is surprising. It shows how
+much of each state each side called, and a low kappa driven by a lopsided
+marginal is a composition artefact rather than a segmentation failure.
+
+Two arguments change the question being asked:
+
+* `statecol = "total.allele.copies"` scores integer copy number instead of the
+  `AMP`/`NEUT`/`HETDEL` label -- a stricter test.
+* `simplify = TRUE` collapses `HETDEL` and `HOMDEL` into a single `DEL`, and
+  strips the `-LOH` suffixes, matching what `cnvMetrics()` does. The default is
+  `FALSE` here on purpose: the homozygous/heterozygous distinction is usually
+  the one that matters most.
+
+### When to use it
+
+Reach for kappa first, every time, whenever a trusted reference is available and
+one number per caller is wanted. It is the right ranking statistic for a
+benchmark table or a parameter sweep.
+
+Conventional reading of the value (Landis and Koch): above 0.8 almost perfect,
+0.6--0.8 substantial, 0.4--0.6 moderate, 0.2--0.4 fair, below 0.2 barely
+distinguishable from doing nothing. A **negative** kappa in CNV work almost
+always means a purity or ploidy solution has flipped, not that segmentation
+failed.
+
+### Advantages
+
+* Immune to the neutral-genome baseline, which is the failure mode that ruins
+  every naive agreement score.
+* One number, standard, comparable across samples and across studies.
+* Reports how many bins it could not score, making it obvious when it is quietly
+  answering a narrower question than the one posed.
+
+### Limitations
+
+* It merges the two error directions. A caller that misses events and a caller
+  that invents them can score the same kappa; use `computeEventRecovery()` to
+  separate them.
+* It is blind to segment identity. A caller that splits every reference segment
+  in half but states both halves correctly scores a perfect 1.0. That is a
+  feature when only copy number matters, and a trap when breakpoints matter
+  -- see Part 3.
+* Kappa depends on the marginals, so values from samples with very different
+  altered fractions are only loosely comparable.
+
+## `scoreNullCaller()` -- the floor any score has to beat
+
+### What it measures
+
+It builds the caller that emits nothing -- one neutral call over every bin the
+reference covers -- and scores it. Nothing about a real segmentation is
+involved. It is a property of the *sample*.
+
+### Intuition
+
+```{r fig-null, fig.height = 3.6, fig.cap = "Raw agreement achieved by a caller that reports the whole genome as neutral. The do-nothing baseline varies enormously between samples: a raw agreement of 0.80 is excellent on a heavily rearranged genome and worse than useless on a quiet one."}
+quiet_reference <- makeSegmentation(
+  boundaries = c(0, 26, 28, 30) * Mb,
+  states     = c("NEUT", "AMP", "NEUT")
+)
+busy_reference <- makeSegmentation(
+  boundaries = c(0, 4, 9, 14, 18, 24, 30) * Mb,
+  states     = c("AMP", "NEUT", "HETDEL", "AMP", "HETDEL", "AMP")
+)
+
+null_tbl <- bind_rows(
+  data.frame(
+    Sample = "Quiet genome",
+    Baseline = scoreNullCaller(quiet_reference, bins = targets)$null_p_o
+  ),
+  data.frame(
+    Sample = "Our example",
+    Baseline = scoreNullCaller(reference, bins = targets)$null_p_o
+  ),
+  data.frame(
+    Sample = "Heavily rearranged genome",
+    Baseline = scoreNullCaller(busy_reference, bins = targets)$null_p_o
+  )
+)
+null_tbl$Sample <- factor(null_tbl$Sample, levels = rev(null_tbl$Sample))
+
+ggplot(null_tbl, aes(x = Baseline, y = Sample)) +
+  geom_col(fill = "grey65", width = 0.6) +
+  geom_text(aes(label = sprintf("%.2f", Baseline)), hjust = -0.2, size = 5) +
+  scale_x_continuous(limits = c(0, 1.08)) +
+  labs(
+    title = "What doing nothing scores, per sample",
+    x = "Raw agreement of the do-nothing caller"
+  ) +
+  theme_slide()
+```
+
+### How to use it
+
+```{r null-use}
+null_score <- scoreNullCaller(reference, bins = targets)
+null_score$null_p_o
+null_score$null_kappa
+```
+
+### When to use it
+
+Print it next to any raw-agreement or "fraction of genome concordant" figure
+being reported, including ones produced outside this package. It also serves as a
+sanity check on a pipeline: `null_kappa` must come out at zero, and it is
+computed rather than asserted precisely so that a bug in the state handling
+shows up here instead of hiding inside every real score.
+
+### Advantages and limitations
+
+* **Advantage:** turns "is 0.78 good?" from an unanswerable question into an
+  answerable one.
+* **Limitation:** it is a diagnostic, not a metric. There is nothing to rank
+  with it, and reporting it as a caller's score would be meaningless.
+
+## `computeStateConfusion()` -- which states get confused for which
+
+### What it measures
+
+The contingency table kappa is computed from, plus per-state recall, precision
+and F1. Kappa says how much better than chance; this says *where the mistakes
+are*.
+
+### Intuition
+
+```{r fig-confusion, fig.height = 4.4, fig.cap = "Rows are the state in the reference, columns the state the caller assigned, and counts are targets. The conservative caller does not merely score lower -- it fails in a specific way: deletions are called neutral."}
+cm <- computeStateConfusion(conservative, reference, bins = targets)
+
+ggplot(cm$counts, aes(x = query_state, y = subject_state, fill = n)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = n), size = 5) +
+  scale_fill_gradient(low = "grey95", high = "#2B8CBE", guide = "none") +
+  labs(
+    title = "Where the conservative caller loses the deletion",
+    x = "Called by the caller", y = "True state"
+  ) +
+  theme_slide() +
+  theme(axis.title.y = element_text(angle = 90), panel.grid = element_blank())
+```
+
+The off-diagonal cell in the `HETDEL` row is the whole story: every deleted
+target was called neutral.
+
+### How to use it
+
+```{r confusion-use}
+cm$per_state
+```
+
+`recall` is, of the targets the reference calls this state, the fraction the
+caller agreed on. `precision` is the converse. `support_subject` and
+`support_query` are the two marginals -- always check them, because a recall
+computed over four targets is not evidence of anything.
+
+### When to use it
+
+As the immediate follow-up whenever a kappa is disappointing and the reason
+matters before changing a parameter. Also when the states are not equally
+important: a caller with poor overall kappa but excellent `HOMDEL`
+recall may be exactly the right tool for finding tumour-suppressor losses.
+
+### Advantages
+
+* Diagnostic rather than merely evaluative -- it points at a fix.
+* Per-state, so rare but clinically important states are not drowned out by the
+  neutral majority.
+
+### Limitations
+
+* Not a single number, so it cannot rank callers.
+* Per-state rates over small supports are noisy.
+* Like kappa, it is entirely blind to how the genome was cut up.
+
+## `computeEventRecovery()` -- missed events versus invented ones
+
+### What it measures
+
+Two numbers that kappa merges into one:
+
+* **recall** -- of the genuinely altered territory in the reference, how much
+  did the caller find?
+* **precision** -- of what the caller called altered, how much is real?
+
+A segment counts as recovered when at least `concordance_threshold` (default
+half) of its targets carry the matching state, so overlapping a real event while
+calling the wrong copy number does not earn credit. Segments are weighted by
+width by default, so a chromosome-arm event is not traded off against a focal
+one.
+
+### Intuition
+
+```{r fig-recovery, fig.height = 4.6, fig.cap = "The same information kappa compresses into one number, split into the two directions that call for opposite fixes. Bottom right: finds everything and more. Top left: everything it says is right, but it says little."}
+rec_tbl <- bind_rows(lapply(names(callers), function(nm) {
+  r <- computeEventRecovery(callers[[nm]], reference, bins = targets)
+  data.frame(
+    Caller = nm, Recall = r$recall_altered,
+    Precision = r$precision_altered
+  )
+}))
+
+ggplot(rec_tbl, aes(x = Recall, y = Precision, label = Caller)) +
+  geom_point(size = 5, colour = "#D7301F") +
+  geom_text(vjust = -1.1, size = 4.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey70") +
+  scale_x_continuous(limits = c(-0.25, 1.25)) +
+  scale_y_continuous(limits = c(-0.05, 1.20)) +
+  annotate("text",
+    x = 1.0, y = 0.05, label = "over-calling",
+    colour = "grey40", size = 4.5
+  ) +
+  annotate("text",
+    x = 0.12, y = 1.1, label = "under-calling",
+    colour = "grey40", size = 4.5
+  ) +
+  labs(
+    title = "Recall and precision on altered regions",
+    x = "Recall (of real events, how many were found)",
+    y = "Precision (of calls made, how many are real)"
+  ) +
+  theme_slide() +
+  theme(axis.title.y = element_text(angle = 90))
+```
+
+### How to use it
+
+```{r recovery-use}
+rec <- computeEventRecovery(conservative, reference, bins = targets)
+rec[c(
+  "recall_altered", "precision_altered", "sorensen",
+  "n_truth_altered", "n_query_altered"
+)]
+```
+
+### When to use it
+
+Whenever the fix depends on the direction of the error -- which, in practice, is
+whenever a sensitivity knob is being turned. Low recall wants a more sensitive
+setting; low precision wants a less sensitive one; a single score cannot say
+which knob to turn or which way.
+
+### Advantages
+
+* Directional, and therefore actionable.
+* Width-weighted, so large events are not outvoted by focal ones.
+* Segments carrying no target at all are excluded from both numerator and
+  denominator, and counted separately as `n_truth_unscorable` /
+  `n_query_unscorable`. A caller is not charged for events lying entirely
+  between capture targets, which it could not have seen.
+
+### Limitations
+
+* The recall reported is a **raw** recall, not an attainable one. It excludes
+  events with no evidence geometrically, but not events too faint to detect at
+  the sample's purity. On a low-purity sample it will make every caller look
+  worse than it deserves.
+* `concordance_threshold` is a choice, and a segment at 0.49 and one at 0.51 are
+  treated as opposites.
+* Not chance-corrected. Read it alongside kappa, not instead of it.
+
+## `getBinJaccardIndex()` -- the same Jaccard, counted in bins
+
+### What it measures
+
+Exactly what `getJaccardIndex()` in Part 6 measures -- the overlap of the altered
+genome between two segmentations -- with the sets counted in bins of the evidence
+grid instead of in base pairs. Same formula, same definition of a true positive,
+same field names with `_bins` in place of `_bp`.
+
+Every bin is given the state of the segment covering most of it, on both sides. A
+bin is then **altered in the query** if its query state is not neutral, **altered
+in the subject** if its subject state is not neutral, and a **true positive** if
+it is altered on both sides *and* both sides give it the same label:
+
+$$J = \frac{TP}{S + Q - TP}, \qquad D = \frac{2\,TP}{S + Q}$$
+
+Requiring the same label is what makes it the analogue of the base-pair function,
+where a region contributes to `tp` only when it is non-neutral on both sides and
+carries `status == "TP"`. A bin called `AMP` by one side and `HETDEL` by the other
+is in the union and not in the intersection, so it lowers the score twice over.
+
+Bins that no segment covers on one or both sides are in neither set: they are
+excluded from the intersection and from the union alike, never imputed to
+neutral.
+
+### Intuition
+
+On a uniform grid the two versions agree closely, which is the first thing to
+check -- it is the same formula, so they should. The divergence appears exactly
+where the grid is not uniform.
+
+```{r fig-binjaccard, fig.height = 4.8, fig.cap = "Bin-based and base-pair Jaccard for the four callers, plus a fifth constructed to make the two disagree. The first four agree to within 0.02. The desert-spanning caller claims 2.6 Mb of extra amplification of which only 3 targets carry evidence, and the base-pair version charges it almost four times as much as the bin version."}
+# Constructed for this comparison only: the accurate caller plus a spurious
+# amplification laid across the 15-17 Mb capture desert.
+desert_caller <- makeSegmentation(
+  boundaries = c(0, 7.25, 12.80, 14.8, 17.4, 19.15, 22.80, 30) * Mb,
+  states     = c("NEUT", "AMP", "NEUT", "AMP", "NEUT", "HETDEL", "NEUT")
+)
+
+jac_set <- c(callers, list("Desert-spanning caller" = desert_caller))
+
+jac_compare <- bind_rows(lapply(names(jac_set), function(nm) {
+  b <- getBinJaccardIndex(jac_set[[nm]], reference, bins = targets)
+  p <- getJaccardIndex(compareSegmentStatus(
+    asCnvstrml(jac_set[[nm]], nm), reference_obj
+  ))
+  data.frame(
+    Caller = nm,
+    `Bins (getBinJaccardIndex)`    = b$jaccard_bin,
+    `Base pairs (getJaccardIndex)` = p$jaccard,
+    check.names = FALSE
+  )
+}))
+
+jac_long <- tidyr::pivot_longer(jac_compare, -Caller,
+                               names_to = "Unit", values_to = "Jaccard")
+jac_long$Caller <- factor(jac_long$Caller, levels = rev(names(jac_set)))
+
+ggplot(jac_long, aes(x = Jaccard, y = Caller, fill = Unit)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.72) +
+  geom_text(aes(label = sprintf("%.2f", Jaccard)),
+            position = position_dodge(width = 0.8), hjust = -0.15, size = 4.1) +
+  scale_x_continuous(limits = c(0, 1.15), breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+  scale_fill_manual(values = c(
+    "Bins (getBinJaccardIndex)"    = "#2B8CBE",
+    "Base pairs (getJaccardIndex)" = "grey45"
+  )) +
+  labs(title = "The same coefficient on two different units",
+       subtitle = wrapSub("They agree until the unsequenced genome starts carrying weight"),
+       x = "Jaccard index of the altered genome") +
+  theme_slide() +
+  guides(fill = guide_legend(nrow = 2))
+```
+
+For the four callers the two agree to within 0.02, and the conservative caller
+lands on 0.30 either way. That is the expected result: the toy panel tiles the
+chromosome evenly, so counting bins and counting base pairs are nearly
+proportional, and any disagreement would mean one of the two was computing
+something else.
+
+The fifth caller is the point. It is the accurate caller plus a spurious
+amplification from 14.8 to 17.4 Mb -- 2.6 Mb of extra altered territory, of which
+only **3 targets** carry any evidence, because the capture desert runs from 15 to
+17 Mb. The base-pair Jaccard falls from 0.92 to **0.73**; the bin Jaccard falls
+from 0.90 to only **0.85**. The base-pair version charges nearly four times as
+much for a mistake that is mostly in territory nobody sequenced.
+
+Which of those two is right depends on the assay, and that is the whole decision:
+
+* On **capture or amplicon** data, take the bin answer. The caller cannot be
+  credited or charged for a region with no reads, and `bins = targets` is what
+  restricts both sets to the evidence.
+* On **whole-genome** data every base carries evidence, the two converge, and
+  `getJaccardIndex()` is the cheaper call.
+
+### How to use it
+
+```{r binjaccard-use}
+bj <- getBinJaccardIndex(conservative, reference, bins = targets)
+
+unlist(bj)
+```
+
+The field names are those of `getJaccardIndex()`, with `_n` marking the three
+counts as numbers of bins where the base-pair version writes `_bp`. The two
+unitless fractions keep their names unchanged, so a report can switch units
+without renaming anything.
+
+Read the counts before the coefficient. `subject_altered_genome_n` and
+`query_altered_genome_n` are the two set sizes and `tp_altered_genome_n` their
+agreeing intersection, so the conservative caller's 15 against 50 says
+immediately that it is reporting less than a third of the altered genome. The two
+directional fractions decompose the Jaccard exactly as they do in base pairs:
+
+* `matched_query_altered_genome` is a **precision** -- of the bins this caller
+  calls altered, the fraction the reference agrees about;
+* `matched_subject_altered_genome` is a **recall**.
+
+### When to use it
+
+Whenever a single altered-genome overlap number is wanted on target-based data.
+Report it with its two directional fractions rather than alone: the conservative
+caller's Jaccard of 0.30 comes from a precision of 1.00 and a recall of 0.30,
+which is a completely different diagnosis from the shifted caller's 0.52 built
+out of 0.69 and 0.68.
+
+### Advantages
+
+* Same formula and field names as `getJaccardIndex()` -- only the `_bp` counts
+  become `_n` -- so switching units does not mean reinterpreting the output.
+* Excludes the neutral genome, so there is no credit for calling nothing -- the
+  problem Part 2 opens with.
+* Bins no segment covers are excluded from both sets, so a caller is neither
+  rewarded nor punished for placing segments in deserts.
+* `sorensen_bin` is returned alongside, for reports that use Dice.
+
+### Limitations
+
+* Resolution is the bin grid. Two segmentations differing by less than a target
+  spacing are indistinguishable, and a bin straddling a real transition is
+  assigned wholly to one side.
+* Requires states to match exactly, so a caller that finds every event but
+  systematically calls `HETDEL` where the truth says `HOMDEL` scores near zero.
+  Pass `simplify = TRUE` to pool the deletion states when that distinction is not
+  the question.
+* Not chance-corrected, and it says nothing about position or fragmentation
+  beyond what the bin overlap captures. Read it with `computeStateKappa()` and
+  `computeFragmentation()`.
+* Not numerically identical to `getJaccardIndex()` even on whole-genome data: the
+  base-pair version derives its true positives from `compareSegmentStatus()`
+  status labels, this one from per-bin state equality.
+
+# Part 3 -- Did the caller cut the genome in the right places?
+
+Everything in Part 2 is blind to segment identity: split a reference segment in
+two, state both halves correctly, and kappa is still 1.0. The metrics here ask
+the complementary question, and are correspondingly blind to state.
+
+## `getSegmentBreakpoints()` and `computeBoundaryConcordance()`
+
+### What they measure
+
+`getSegmentBreakpoints()` reduces a segmentation to the set of positions where
+it transitions. `computeBoundaryConcordance()` then scores one such set against
+another, counting a called breakpoint as correct when a reference breakpoint
+lies within `tolerance_bp`.
+
+The first and last position on each chromosome are dropped by default. They
+record where the segmentation happened to start and stop -- usually the first
+and last covered target -- rather than a detected transition, and counting them
+inflates the agreement between any two segmentations of the same assay.
+
+### Intuition
+
+```{r fig-boundary, fig.height = 4.6, fig.cap = "A breakpoint counts as found if a real one lies inside its tolerance window. The shifted caller finds the right events and none of the right boundaries."}
+all_tracks <- c(list("Reference truth" = reference), callers)
+bp_frame <- bind_rows(lapply(names(all_tracks), function(nm) {
+  data.frame(
+    Segmentation = nm,
+    pos = start(getSegmentBreakpoints(all_tracks[[nm]]))
+  )
+}))
+bp_frame$Segmentation <- factor(
+  bp_frame$Segmentation,
+  levels = rev(c("Reference truth", names(callers)))
+)
+bp_frame$row <- as.numeric(bp_frame$Segmentation)
+
+tolerance <- 0.3 * Mb
+ref_bp <- data.frame(pos = start(getSegmentBreakpoints(reference)))
+
+ggplot() +
+  geom_rect(
+    data = ref_bp,
+    aes(
+      xmin = (pos - tolerance) / Mb, xmax = (pos + tolerance) / Mb,
+      ymin = 0.4, ymax = 5.6
+    ),
+    fill = "#2B8CBE", alpha = 0.18
+  ) +
+  geom_point(
+    data = bp_frame, aes(x = pos / Mb, y = row),
+    size = 3.5, colour = "#D7301F"
+  ) +
+  scale_y_continuous(breaks = 1:5, labels = levels(bp_frame$Segmentation)) +
+  labs(
+    title = "Breakpoints, and the 300 kb window they have to land in",
+    subtitle = "Blue bands are the tolerance windows around the true transitions",
+    x = "Position on chr1 (Mb)"
+  ) +
+  theme_slide()
+```
+
+### How to use it
+
+```{r boundary-use}
+bind_rows(lapply(names(callers), function(nm) {
+  b <- computeBoundaryConcordance(callers[[nm]], reference, tolerance_bp = 3e5)
+  data.frame(
+    Caller = nm,
+    precision = round(b$boundary_precision, 3),
+    recall = round(b$boundary_recall, 3),
+    f1 = round(b$boundary_f1, 3),
+    n_called = b$n_query_breakpoints
+  )
+}))
+```
+
+Read the two rates as a pair. Low precision with high recall is
+over-segmentation: it found every real transition and a great many others. The
+reverse is a caller that merges events.
+
+### Choosing the tolerance
+
+The default of 300 kb encodes a real claim: a breakpoint called within about
+three bins of the truth *is* the same breakpoint, because no capture assay
+localises a transition more precisely than the spacing of its targets. Tighten
+it only if the grid genuinely supports it, and note the asymmetry -- a generous
+tolerance flatters an over-segmented caller, because more of its spurious
+breakpoints fall inside some window.
+
+### When to use it
+
+Whenever the boundary positions themselves matter: matching CNV ends to
+structural-variant breakpoints, deciding whether an event is focal or arm-level,
+or defining a region for downstream gene-level annotation.
+
+### Advantages
+
+* Completely state-blind, so it isolates the structural half of the problem. A
+  caller scoring 1.0 here and near 0 on kappa has found the right transitions
+  and mis-assigned every level -- a purity or ploidy problem, not a segmentation
+  one.
+* Precision and recall separately, so the direction of the error is visible.
+
+### Limitations
+
+* The score is meaningless without stating the tolerance, which is why the
+  function echoes it back in its return value.
+* Matching is done independently in each direction, so three query breakpoints
+  crowded into one window all count as matched against a single reference
+  breakpoint. That is deliberate -- the separate denominators are what stop
+  crowding from being rewarded -- but it means `n_matched_query` and
+  `n_matched_subject` can differ.
+* Two empty breakpoint sets score a perfect 1.0. They genuinely do agree that
+  the genome has no internal transitions, but this is worth knowing before
+  reading that 1.0 as skill.
+
+## `computeSegmentationARI()` -- do the two agree on what belongs together?
+
+### What it measures
+
+Treat each segmentation as a way of grouping bins: two bins are "together" if
+the same segment contains them. The adjusted Rand index asks how often the two
+segmentations agree about whether a *pair* of bins belongs together, corrected
+for the agreement expected by chance. 1 is identical, 0 is no better than
+random.
+
+### Intuition
+
+```{r fig-ari, fig.height = 4.2, fig.cap = "The adjusted Rand index counts pairs of bins the two segmentations agree to keep together or to separate. Bins A and B are together in the reference and apart for the caller, so they form a disagreeing pair; A and C are apart in both, so they agree."}
+demo_ref <- makeSegmentation(c(0, 15, 30) * Mb, c("NEUT", "AMP"))
+demo_frag <- makeSegmentation(
+  c(0, 8, 15, 22, 30) * Mb,
+  c("NEUT", "NEUT", "AMP", "AMP")
+)
+demo_points <- data.frame(
+  pos = c(3, 11, 20) * Mb,
+  label = c("Bin A", "Bin B", "Bin C")
+)
+
+plotTracks(list("Fragmented caller" = demo_frag, "Reference" = demo_ref),
+  title = "Bin pairs, not bins"
+) +
+  geom_vline(
+    data = demo_points, aes(xintercept = pos / Mb),
+    linetype = "dotted", colour = "grey20"
+  ) +
+  geom_text(
+    data = demo_points, aes(x = pos / Mb, y = 2.65, label = label),
+    size = 4.6
+  )
+```
+
+### How to use it
+
+```{r ari-use}
+bind_rows(lapply(names(callers), function(nm) {
+  a_seg <- computeSegmentationARI(callers[[nm]], reference,
+    bins = targets,
+    partition_by = "segment"
+  )
+  a_state <- computeSegmentationARI(callers[[nm]], reference,
+    bins = targets,
+    partition_by = "state"
+  )
+  data.frame(
+    Caller = nm,
+    ari_segment = round(a_seg$ari, 3),
+    ari_state = round(a_state$ari, 3),
+    n_query_segments = a_seg$n_query_groups
+  )
+}))
+```
+
+The `partition_by` argument is the whole point and there is no sensible default
+to hide it behind:
+
+* `"segment"` (the default) labels each bin by **which segment contains it**. A
+  caller that cleanly halves every reference segment, stating both halves
+  correctly, scores about 0.5 -- right biology, wrong granularity, which is
+  exactly what this mode is for.
+* `"state"` labels each bin by its **copy-number state**. The same caller scores
+  1.0. Use `computeStateKappa()` for that question instead; it is the standard
+  statistic and its value has a direct reading, whereas an ARI over a state
+  partition is a pair-counting quantity with no comparable interpretation.
+
+### When to use it
+
+When a single structural agreement number is needed and granularity matters --
+comparing segmentation algorithms, or tuning a smoothing parameter.
+
+### Advantages
+
+* Chance-corrected, so it is not inflated by there being many segments.
+* Sensitive to over- and under-segmentation in a way that state metrics
+  structurally cannot be.
+* Needs no state column at all in `"segment"` mode, so it works on segmentations
+  that carry only coordinates.
+
+### Limitations
+
+* Symmetric: it reports that the two differ, never which is fragmented. Pair it
+  with `computeFragmentation()`.
+* Not a metric in the mathematical sense (no triangle inequality), so
+  "caller A is closer to the truth than caller B" does not chain reliably.
+  `computeSegmentationVI()` does have that property.
+* The value depends on the bin grid, so only compare ARIs computed on the same
+  grid. This is why the auto-tiled grid here is derived from the genome rather
+  than from the coordinate range of the inputs.
+
+## `computeSegmentationVI()` -- an information-theoretic distance
+
+### What it measures
+
+Variation of information: having been told one segmentation, how much is still
+unknown about the other?
+
+$$VI(A, B) = H(A) + H(B) - 2\,I(A;B)$$
+
+Lower is better; 0 means identical. Unlike ARI it is a true metric -- symmetric,
+and obeying the triangle inequality -- and, more usefully, it **decomposes**.
+The `h_query - mi` term is information the caller has that the reference does
+not (over-segmentation); `h_subject - mi` is the reverse (under-segmentation).
+
+### Intuition
+
+```{r fig-vi, fig.height = 4.6, fig.cap = "Variation of information splits into the part of the disagreement caused by splitting and the part caused by merging. Total bar length is the variation of information; the split says which direction the error runs."}
+vi_tbl <- bind_rows(lapply(names(callers), function(nm) {
+  v <- computeSegmentationVI(callers[[nm]], reference, bins = targets)
+  data.frame(
+    Caller = nm,
+    `Excess detail in the caller (splitting)` = v$h_query - v$mi,
+    `Detail lost by the caller (merging)` = v$h_subject - v$mi,
+    check.names = FALSE
+  )
+}))
+vi_long <- tidyr::pivot_longer(vi_tbl, -Caller,
+  names_to = "Component",
+  values_to = "Nats"
+)
+vi_long$Caller <- factor(vi_long$Caller, levels = rev(names(callers)))
+
+ggplot(vi_long, aes(x = Nats, y = Caller, fill = Component)) +
+  geom_col(width = 0.65) +
+  scale_fill_manual(values = c("#D7301F", "#2B8CBE")) +
+  labs(
+    title = "The two halves of a segmentation disagreement",
+    x = "Variation of information (nats)"
+  ) +
+  theme_slide() +
+  guides(fill = guide_legend(nrow = 2))
+```
+
+### How to use it
+
+```{r vi-use}
+v <- computeSegmentationVI(fragmented, reference, bins = targets)
+c(
+  vi = round(v$vi, 3), nvi = round(v$nvi, 3),
+  over = round(v$h_query - v$mi, 3), under = round(v$h_subject - v$mi, 3)
+)
+```
+
+**Use `nvi`, not `vi`, for anything comparative.** Raw VI is unbounded and grows
+with the number of bins, so a VI of 1.2 on a 3,000-bin grid and a VI of 1.2 on a
+200,000-bin grid mean quite different things, and averaging raw VI across
+samples whose grids differ is meaningless. `nvi` divides by `log(n_bins)`, the
+maximum attainable, giving a `[0, 1]` quantity that can be averaged.
+
+### When to use it
+
+When distances that behave like distances are needed -- clustering
+segmentations, building a dendrogram of callers, or embedding a parameter sweep
+-- and when the over/under decomposition is wanted for free.
+
+### Advantages
+
+* A true metric, so distances compose.
+* Decomposes cleanly into the two directions of error.
+* Well behaved when the two segmentations have very different numbers of
+  segments, where ARI can be erratic.
+
+### Limitations
+
+* Measured in nats, which nobody has an intuition for. A VI of 0.4 is not
+  self-explanatory the way a kappa of 0.4 is.
+* Not chance-corrected in the way ARI is; two random partitions do not score a
+  fixed value.
+* Raw `vi` is not comparable across grids. Use `nvi`.
+
+## `computeFragmentation()` -- which way does the disagreement run?
+
+### What it measures
+
+ARI and VI both say two segmentations differ; `computeFragmentation()` says
+whether the caller is splitting the reference or merging it, and by how much.
+
+### Intuition
+
+```{r fig-frag, fig.height = 4.4, fig.cap = "How many caller segments meet a single reference segment. Above one is splitting; the conservative caller sits below one on the reverse measure, meaning it merges. The dashed line is a one-to-one correspondence between the two segmentations."}
+frag_tbl <- bind_rows(lapply(names(callers), function(nm) {
+  f <- computeFragmentation(callers[[nm]], reference, bins = targets)
+  data.frame(
+    Caller = nm,
+    `Caller segments per reference segment` = f$mean_query_per_subject,
+    `Reference segments per caller segment` = f$mean_subject_per_query,
+    check.names = FALSE
+  )
+}))
+frag_long <- tidyr::pivot_longer(frag_tbl, -Caller,
+  names_to = "Direction",
+  values_to = "Mean"
+)
+frag_long$Caller <- factor(frag_long$Caller, levels = rev(names(callers)))
+
+ggplot(frag_long, aes(x = Mean, y = Caller, fill = Direction)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = c("#D7301F", "#2B8CBE")) +
+  labs(
+    title = "Splitting or merging?",
+    x = "Mean number of partner segments (bin-weighted)"
+  ) +
+  theme_slide() +
+  guides(fill = guide_legend(nrow = 2))
+```
+
+### How to use it
+
+```{r frag-use}
+f <- computeFragmentation(fragmented, reference, bins = targets)
+f[c(
+  "split_ratio", "merge_ratio",
+  "mean_query_per_subject", "mean_subject_per_query"
+)]
+```
+
+`mean_query_per_subject` is the average number of distinct caller segments
+overlapping one reference segment, weighted by bins. A value of 2 means the
+caller cuts each reference segment in half on average; 1 means one-to-one; below
+1 is not attainable, since a reference segment always meets at least one caller
+segment among its scorable bins.
+
+`split_ratio` and `merge_ratio` are plain segment-count ratios. They react
+faster but ignore how much genome each segment covers, so read them together: a
+`split_ratio` of 5 with a `mean_query_per_subject` of 1.1 is a caller adding
+many tiny segments in *one place*, not fragmenting throughout.
+
+### When to use it
+
+Immediately after ARI or VI shows that the segmentations differ, and always when
+tuning a sensitivity or smoothing parameter -- this is the number that indicates
+which way to turn it.
+
+### Advantages
+
+* Directional and blunt: it can be acted on without further interpretation.
+* Computed on bins, so a segment sitting over an unsequenced region does not
+  count as evidence of fragmentation.
+
+### Limitations
+
+* Not normalised to `[0, 1]` and not chance-corrected, so it ranks nothing on
+  its own.
+* Averages hide locality. A genome that is perfect everywhere except one
+  shattered chromosome looks mildly fragmented throughout.
+
+# Part 4 -- Which individual segments can be trusted?
+
+Parts 2 and 3 reduce a whole segmentation to a handful of numbers. That is what
+is needed to *choose* a caller; it is useless for the question that comes next,
+which is which of the chosen caller's segments to believe. These functions
+attach the comparison to each segment, so the segmentation can be filtered
+rather than accepted or rejected whole.
+
+## `annotateBinStateConcordance()` -- per-segment state accuracy
+
+### What it measures
+
+For each segment, the fraction of its targets whose state matches what the
+reference says about the same targets. Size-neutral: a two-target segment that
+is entirely right scores 1, the same as a two-thousand-target one.
+
+### Intuition
+
+Laid out like Figure 1 -- the truth on top, the callers underneath -- but with
+each segment shaded by its own score rather than by its state. Every caller is
+wrong in a different place, and the picture says where.
+
+```{r fig-conc, fig.height = 6.4, fig.cap = "Per-segment state concordance for all four callers against the reference. Green segments state the copy number correctly over their targets; red ones do not. The spurious neutral gap the fragmented caller inserted inside the amplification is the single red block on its row."}
+conc_scored <- lapply(callers, function(x) {
+  annotateBinStateConcordance(x, reference, bins = targets)
+})
+
+scoredTrackFigure(
+  conc_scored,
+  score_col = "state.concordance",
+  score_name = "State concordance",
+  title = "Per-segment state accuracy, caller by caller",
+  subtitle = "Each segment shaded by the fraction of its targets whose state is correct"
+)
+```
+
+Read it row by row. The **accurate caller** is uniformly green: every segment
+states the right level over its own targets. The **fragmented caller** is almost
+all green too -- and that is the point of a size-neutral score, because its
+shards are individually correct even though the segmentation as a whole is
+over-cut; only the invented neutral gap at 9.2-9.9 Mb goes red. The
+**conservative caller** shows the opposite pattern: its huge final segment is a
+middling yellow-green, because it is right over the neutral stretches and wrong
+over the whole deletion it missed. The **shifted caller** degrades gently
+everywhere, which is the signature of correct events at wrong coordinates.
+
+### How to use it
+
+```{r conc-use}
+frag_scored <- conc_scored[["Fragmented caller"]]
+
+head(as.data.frame(mcols(frag_scored)), 4)
+```
+
+Three columns are attached: `state.concordance` (the fraction),
+`state.n_matched` and `state.n_total`. The counters matter -- they are what
+aggregates correctly. Pooling `state.n_matched` over `state.n_total` gives the
+target-weighted accuracy of the whole segmentation; averaging the per-segment
+fractions gives every segment an equal vote. Both are useful, they are not the
+same number, and `summariseStateConcordance()` reports each.
+
+The function is **directional**, and both directions are worth computing:
+
+* caller against reference behaves like a precision -- of what this segment
+  claims, how much is right;
+* reference against caller behaves like a recall -- of what was really there,
+  how much was found.
+
+### When to use it
+
+To filter. Drop or flag the segments that score badly, keep the rest, and carry
+on with a partially trustworthy call set rather than throwing the sample away.
+Also as the input to `computeEventRecovery()`, which is built on top of it.
+
+### Advantages
+
+* Size-neutral, so a small correct segment is not swamped by a large one.
+* Returns a `GRanges` with new `mcols`, following the same convention as
+  `compareSegmentOverlap()`, so it drops straight into an existing workflow.
+* Hoistable: pass a precomputed `reference_state` from `assignBinState()` when
+  scoring many segmentations against one reference.
+
+### Limitations
+
+* A segment with no target carrying a defined reference state gets `NA`, not 0.
+  These are genuinely different -- "nothing to score against" versus "had
+  targets and got them all wrong" -- and conflating them when aggregating will
+  quietly reward callers that place segments in deserts.
+* Blind to position: a segment can score 1.0 while sitting well away from the
+  reference segment it agrees with. Pair it with `annotateBinJaccard()`.
+
+## `annotateBinJaccard()` -- per-segment positional overlap
+
+### What it measures
+
+For every segment on **both** sides, the Jaccard overlap with its best-matching
+counterpart, measured in targets rather than base pairs, together with that
+counterpart's state and the three counts the score is built from.
+
+Measuring in targets is the point. On capture data the base-pair extent of a
+segment is dominated by the unsequenced gaps it spans, so a base-pair Jaccard
+behaves largely as a segment-length metric and rewards a caller for placing
+boundaries in deserts where no evidence exists. Counting targets measures the
+evidence that was actually available.
+
+### Intuition
+
+Again in the layout of Figure 1. Compare this figure with the concordance one
+above: the two score the *same* segmentations on unrelated criteria, and the
+rows that look good here are not the rows that looked good there.
+
+```{r fig-jaccard-tracks, fig.height = 6.4, fig.cap = "Best target-set Jaccard for each segment against its best-matching reference partner. The fragmented caller scores poorly everywhere despite being state-correct everywhere, because each of its shards covers only a fraction of the reference segment it matches."}
+jac_scored <- lapply(callers, function(x) {
+  annotateBinJaccard(x, reference, bins = targets)$query
+})
+
+scoredTrackFigure(
+  jac_scored,
+  score_col = "bin.jaccard.index",
+  score_name = "Best target Jaccard",
+  title = "Per-segment positional overlap, caller by caller",
+  subtitle = "Grey would mark a segment with no overlapping counterpart"
+)
+```
+
+This is the figure that shows why the two per-segment annotators must be read
+together. The **fragmented caller** was almost entirely green in the concordance
+figure and is almost entirely orange here: every shard names the right copy
+number, and no shard covers its reference segment. Conversely the
+**conservative caller**'s first segment is a solid green -- it overlaps the
+neutral reference stretch well -- while the amplification it does report is a
+poor positional match. A caller can be trusted on state and not on extent, or
+the reverse, and one number cannot express that.
+
+### The counts behind the score
+
+```{r fig-jaccard, fig.height = 4.8, fig.cap = "The three target counts distinguish a merge from a split, which the Jaccard alone cannot."}
+jac <- annotateBinJaccard(fragmented, reference, bins = targets)
+jac_df <- as.data.frame(jac$query)
+jac_df$segment <- sprintf("%.1f-%.1f Mb", jac_df$start / Mb, jac_df$end / Mb)
+jac_df$segment <- factor(jac_df$segment, levels = rev(jac_df$segment))
+
+counts_long <- tidyr::pivot_longer(
+  jac_df,
+  cols = c("bin.jaccard.n_self", "bin.jaccard.n_match", "bin.jaccard.n_shared"),
+  names_to = "Count", values_to = "Targets"
+)
+counts_long$Count <- factor(
+  counts_long$Count,
+  levels = c("bin.jaccard.n_self", "bin.jaccard.n_match", "bin.jaccard.n_shared"),
+  labels = c("In this caller segment", "In its best reference partner", "Shared")
+)
+
+ggplot(counts_long, aes(x = Targets, y = segment, fill = Count)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  scale_fill_manual(values = c("#D7301F", "#2B8CBE", "grey40")) +
+  labs(
+    title = "Reading the target counts of the fragmented caller",
+    subtitle = "Own count far below the partner's = a split. Far above it = a merge.",
+    x = "Number of capture targets"
+  ) +
+  theme_slide() +
+  guides(fill = guide_legend(nrow = 2))
+```
+
+### How to use it
+
+```{r jaccard-use}
+head(as.data.frame(mcols(jac$query))[, c(
+  "cnv.annotation", "bin.jaccard.index",
+  "bin.jaccard.status",
+  "bin.jaccard.n_self",
+  "bin.jaccard.n_match",
+  "bin.jaccard.n_shared"
+)], 5)
+```
+
+Three ways to score low, distinguished by the counts:
+
+* `n_self` much greater than `n_match` -- this segment swallowed several
+  counterparts: a **merge**, wanting more sensitivity.
+* `n_self` much less than `n_match` -- this segment is one shard of a
+  counterpart: a **split**, wanting less.
+* both similar with a small `n_shared` -- the segments are simply in different
+  places.
+
+`bin.jaccard.status` carries the state of the winning counterpart, so a segment
+with a good overlap but a mismatched status has found the right region and the
+wrong copy number.
+
+### When to use it
+
+Whenever per-segment confidence is needed for downstream reporting -- flagging
+which gene-level calls rest on a well-matched segment, for instance. Use it
+alongside `annotateBinStateConcordance()`: this one rewards positional overlap
+and is indifferent to state, the other is the opposite.
+
+### Advantages
+
+* Annotates both sides in one call, so unmatched reference segments (missed
+  events) and unmatched caller segments (invented ones) are both visible.
+* Target-based, so it is not fooled by capture deserts.
+* Single bin assignment means `n_self + n_match - n_shared` is a true set union;
+  counting overlaps instead would count a boundary-straddling target twice.
+
+### Limitations
+
+* A segment with no overlapping counterpart gets `NA`, flagged as
+  `"NO_OVERLAP"`. For per-segment inspection that is correct; for an average it
+  is a genuine zero, and `summariseSegmentJaccard()` treats it as one while
+  separately reporting how often it happened.
+* Best-match only. A segment split evenly across two counterparts is scored
+  against one of them.
+* Entirely state-blind in the score itself.
+
+## `computeBreakpointConsistency()` and `annotateBreakpointConsistency()`
+
+### What they measure
+
+These two are the bridge into Part 5: they need no reference at all.
+`computeBreakpointConsistency()` takes a *family* of segmentations of the same
+sample -- several callers, or the same caller at several settings -- clusters
+their boundaries, and reports for each cluster the fraction of the family that
+places a boundary there. `annotateBreakpointConsistency()` then attaches those
+recurrence scores back onto the boundaries of any one segmentation.
+
+### Intuition
+
+Because this metric needs no reference, the natural picture is the whole family
+at once: the segment tracks of Figure 1 on top, and underneath, how much of the
+family votes for each boundary cluster.
+
+```{r fig-consistency, fig.height = 6.6, fig.cap = "Boundaries every caller agrees on are almost certainly real transitions. Boundaries only one caller reports are usually artefacts of its settings. The dotted verticals carry the cluster positions up through the tracks; the blue dashed lines in the lower panel are the true transitions, shown only for orientation -- the score never sees them."}
+consistency <- computeBreakpointConsistency(callers, tolerance_bp = 3e5)
+
+track_top <- plotTracks(
+  c(list("Reference truth" = reference), callers),
+  title = "Where the family agrees a boundary belongs",
+  subtitle = wrapSub("Lower panel: the fraction of the four callers placing a boundary in each cluster")
+) +
+  geom_vline(
+    data = consistency, aes(xintercept = pos / Mb),
+    colour = "grey35", linetype = "dotted", linewidth = 0.4
+  ) +
+  xlim_chr + labs(x = NULL) +
+  theme(axis.text.x = element_blank(), plot.margin = margin(b = 2))
+
+cons_bottom <- ggplot(consistency, aes(x = pos / Mb, y = consistency)) +
+  geom_col(aes(fill = consistency), width = 0.35) +
+  geom_vline(
+    data = data.frame(pos = start(getSegmentBreakpoints(reference))),
+    aes(xintercept = pos / Mb), linetype = "dashed",
+    colour = "#2B8CBE", linewidth = 0.7
+  ) +
+  scale_fill_gradient(
+    low = "#FDD0A2", high = "#00441B",
+    limits = c(0, 1), guide = "none"
+  ) +
+  scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1)) +
+  xlim_chr +
+  labs(x = "Position on chr1 (Mb)", y = "Callers") +
+  theme_slide() +
+  theme(axis.title.y = element_text(angle = 90), plot.margin = margin(t = 2))
+
+track_top / cons_bottom + plot_layout(heights = c(5, 2), guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+Fifteen clusters come out, and the split is instructive. Ten sit at 0.25 -- each
+the private invention of a single caller: six from the fragmented caller (3.4,
+9.2, 9.9, 15.5, 21.0 and 26.2 Mb), three from the shifted caller (5.4, 20.6,
+24.4 Mb) and one from the conservative caller (8.5 Mb). Those are the boundaries
+to drop.
+
+Five clusters reach 0.5, the ceiling for this family, and **four** of them sit on
+a true transition -- 7.175, 12.85, 19.125 and 22.85 Mb, each carried by the
+accurate and fragmented callers together. So far the metric is doing exactly what
+it promises.
+
+The fifth is the one to study. The cluster at **11.4 Mb is not a transition at
+all**: it is where the conservative caller ends its truncated amplification
+(11.5 Mb) and the shifted caller ends its displaced one (11.3 Mb). Two
+independent callers, two different failure modes, one coincidental agreement --
+and it scores just as highly as the four genuine transitions. This is the
+limitation at the end of this section made concrete, and it is worth internalising
+before using consistency to filter anything: the score cannot distinguish a
+boundary that is reproducible because it is real from one that is reproducible
+because two callers happen to be wrong in the same place.
+
+### How to use it
+
+```{r consistency-use}
+consistency
+
+ann <- annotateBreakpointConsistency(accurate, consistency, tolerance_bp = 3e5)
+ann$summary
+```
+
+Clustering walks the sorted positions on each chromosome and opens a new cluster
+whenever the next position is further than `tolerance_bp` from the **running
+median** of the open one. Using the median rather than the last position is what
+stops a chain of closely spaced boundaries from merging into one cluster of
+unbounded width. Each segmentation contributes at most one vote per cluster, so
+a caller that shatters a region cannot manufacture support for it.
+
+### When to use it
+
+On real samples, where no truth exists. A segmentation built mostly out of
+idiosyncratic boundaries is over-fitted to its parameters, and its mean
+consistency says so before any truth is consulted. Also as a map: the unanimous
+clusters are the transitions the data forces regardless of setting, and are the
+safest coordinates to hand to downstream analysis.
+
+### Advantages
+
+* Needs no ground truth.
+* Works both as a genome-wide map and as a per-segment annotation.
+* Cheap -- it only touches boundary coordinates, not bins.
+
+### Limitations
+
+* **Recurrence is agreement, not correctness.** If most members of the family
+  share a failure mode -- and settings of the same algorithm frequently do -- a
+  wrong boundary can be perfectly consistent. Treat a high score as the absence
+  of one specific defect, not as evidence of quality.
+* Sensitive to family composition. Three variants of one algorithm plus one
+  independent one is not a panel of four opinions.
+* Sensitive to `tolerance_bp`, which must match between the two functions.
+
+# Part 5 -- No truth available: comparing callers to each other
+
+Everything above needs a reference known to be right, which in practice means
+simulated data. The two functions here compare a family of segmentations to each
+other, so they run on real samples.
+
+The same caveat applies to both, and it is important enough to repeat: **at very
+low purity every caller agrees that nothing happened, and every caller is
+wrong.** The maximum agreement score is produced both by an easy sample and by
+an impossible one. High agreement is evidence of quality only conditional on the
+sample being solvable at all, and that has to be established separately -- from
+purity, coverage and noise.
+
+For this reason the vocabulary here is deliberately different: the pairwise
+quantity is called `overlap` rather than `jaccard`, and nothing is called recall
+or precision. These are caller-versus-caller quantities with no reference
+involved, and naming them like the truth-based metrics would let a consensus
+number pass for an achieved-quality one.
+
+## `computeCallerAgreement()` -- do the callers see the same thing?
+
+### What it measures
+
+Tiles the genome, asks every caller whether each bin is altered, and summarises
+how much the answers coincide. Where `computeBreakpointConsistency()` asks
+whether the callers cut in the same places, this asks whether they agree about
+what is there.
+
+### Intuition
+
+```{r fig-agreement, fig.height = 4.6, fig.cap = "Pairwise agreement on which targets are altered. The callers that find both events agree with each other; the conservative caller, which misses the deletion, sits apart from all of them."}
+ag <- computeCallerAgreement(callers, bins = targets)
+
+pairs_sym <- bind_rows(
+  ag$pairwise[, c("method_a", "method_b", "overlap")],
+  data.frame(
+    method_a = ag$pairwise$method_b,
+    method_b = ag$pairwise$method_a,
+    overlap = ag$pairwise$overlap
+  ),
+  data.frame(method_a = names(callers), method_b = names(callers), overlap = 1)
+)
+
+ggplot(pairs_sym, aes(x = method_a, y = method_b, fill = overlap)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = sprintf("%.2f", overlap)), size = 5) +
+  scale_fill_gradient(
+    low = "grey95", high = "#2B8CBE", limits = c(0, 1),
+    guide = "none"
+  ) +
+  labs(
+    title = "How much the callers agree about the altered genome",
+    subtitle = "Overlap of the sets of targets each pair calls altered. No truth is involved.",
+    x = NULL, y = NULL
+  ) +
+  theme_slide() +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    panel.grid = element_blank()
+  )
+```
+
+### How to use it
+
+```{r agreement-use}
+ag$summary
+```
+
+`agree_frac_majority` is the fraction of targets more than half the callers call
+altered -- a rough consensus altered fraction. `agree_vote_entropy_mean` is the
+per-target vote entropy: zero when the callers are unanimous either way, maximal
+when they split down the middle. A high entropy is the clearest signal that a
+sample is genuinely ambiguous rather than merely difficult for one caller.
+
+### When to use it
+
+As a per-sample QC flag on real cohorts, and as the natural companion to
+`computeBreakpointConsistency()`. Low agreement combined with adequate purity
+and coverage is a sample worth looking at by hand.
+
+### Advantages
+
+* No ground truth needed, so it runs on every real sample available.
+* Reports the pairwise detail as well as the summary, so an outlier caller is
+  identifiable rather than merely averaged in.
+* The entropy term distinguishes "everyone is confidently wrong together" from
+  "the callers are split".
+
+### Limitations
+
+* Agreement is not monotone with quality; see the caveat opening this section.
+* Reduces states to altered/not, discarding the amplification versus deletion
+  distinction entirely.
+* Callers sharing a code lineage will agree with each other for reasons that
+  have nothing to do with the data.
+
+## `computeConsensusAgreement()` -- which caller is the odd one out?
+
+### What it measures
+
+For every caller, how well its altered regions match the majority verdict of the
+**other** callers. The consensus is computed leave-one-out, so a caller is never
+scored against a consensus it helped define.
+
+### Intuition
+
+```{r fig-consensus, fig.height = 4.6, fig.cap = "Two directional scores that must be read as a pair: how much of the peers' consensus a caller recovers, and how much of its own output the peers back. Leave-one-out, so no caller is scored against a consensus it helped build."}
+loo <- computeConsensusAgreement(callers, bins = targets)
+
+ggplot(loo, aes(
+  x = loo_consensus_captured, y = loo_consensus_supported,
+  label = method
+)) +
+  geom_point(aes(size = altered_rate), colour = "#D7301F") +
+  geom_text(vjust = -1.6, size = 4.6) +
+  scale_size_continuous(range = c(3, 9), name = "Fraction of genome called altered") +
+  scale_x_continuous(limits = c(-0.25, 1.25)) +
+  scale_y_continuous(limits = c(-0.05, 1.20)) +
+  annotate("text",
+    x = 1.0, y = 0.08, label = "over-calling",
+    colour = "grey40", size = 4.5
+  ) +
+  annotate("text",
+    x = 0.15, y = 1.1, label = "under-calling",
+    colour = "grey40", size = 4.5
+  ) +
+  labs(
+    title = "Each caller against the consensus of the others",
+    x = "Share of the peers' consensus this caller recovers",
+    y = "Share of this caller's calls the peers back"
+  ) +
+  theme_slide() +
+  theme(axis.title.y = element_text(angle = 90), legend.title = element_text())
+```
+
+### How to use it
+
+```{r consensus-use}
+loo[
+  order(-loo$loo_consensus_overlap),
+  c(
+    "method", "loo_consensus_overlap", "loo_mean_pairwise",
+    "loo_consensus_captured", "loo_consensus_supported", "altered_rate"
+  )
+]
+```
+
+`loo_consensus_overlap` merges both directions into one symmetric number and
+cannot distinguish them; the two directional columns can. Always read
+`altered_rate` alongside them -- a caller that calls nothing altered has an
+uninterpretable pair of directional scores.
+
+`loo_mean_pairwise` is the mean overlap against each other caller taken
+individually. It is less brittle than the consensus when the peers disagree
+among themselves, and with a small family it is often the more informative of
+the two.
+
+### Why it does not use `findConsensus()`
+
+`findConsensus()` and `ensemblCall()` merge segments and fill gaps, which
+changes the geometry: the result is not the set of regions the peers agreed on
+but a post-processed segmentation of it. Comparing against that would silently
+mix "do the callers agree" with "does merging help". A bin vote is used instead,
+which is also several orders of magnitude faster to rebuild once per caller.
+
+### When to use it
+
+As a truth-free selection signal on real samples: absent a shared failure mode,
+the output that best matches what everyone else independently found is more
+likely to be right. Also as a caller-level QC across a cohort -- a caller that is
+consistently the outlier is worth investigating.
+
+### Advantages
+
+* Leave-one-out, so it does not reward typicality inconsistently in proportion
+  to how much each caller contributed to the thing it is scored against.
+* Directional, so over- and under-calling are distinguishable.
+* Fast enough to run on every sample in a cohort.
+
+### Limitations
+
+* With only two callers the "consensus" is the other caller, and the metric
+  degenerates into a pairwise overlap.
+* With three callers the peer consensus requires both peers to agree, since a
+  strict majority of two is two. This is the right choice -- a tie is precisely
+  the case where there is no consensus -- but it makes the score conservative.
+* Rewards the mainstream. A caller that is right where everyone else is wrong
+  scores badly, by construction.
+
+# Part 6 -- Whole-profile comparison on `cnvstrml` objects
+
+Everything so far has worked on bare `GRanges` and measured agreement over an
+evidence grid. The functions in this part take `cnvstrml` objects instead and
+measure agreement in **base pairs**. That difference is not cosmetic, and the
+first thing to be clear about is when each is appropriate:
+
+* **Target-based** (Parts 2 to 5). Counts only the genome the assay could see.
+  Correct for capture and amplicon data, where most of the genome carries no
+  evidence.
+* **Base-pair based** (this part). Counts every base equally, including the ones
+  nobody sequenced. Correct for whole-genome data, and actively misleading on a
+  capture panel, where it rewards a caller for spanning deserts.
+
+These also read allele copy numbers and log-ratios, so they can say things the
+bin metrics cannot -- which *state* was confused, and how much of the altered
+genome was recovered.
+
+## `compareSegmentStatus()` -- the base-pair contingency everything here builds on
+
+### What it measures
+
+Intersects the query and subject segmentations bidirectionally, so only genuinely
+shared regions are compared, and labels each resulting region three times over:
+agreement on the `cnv.annotation` state, on total copy number, and on clonal
+fraction (within a `wiggle` tolerance).
+
+### How to use it
+
+```{r status-use}
+cmp <- compareSegmentStatus(caller_objs[["Accurate caller"]], reference_obj)
+
+head(cmp$table, 5)
+```
+
+`status` is the column to read first: **TP** where the annotations match, **FP**
+where the query says `NEUT` and the subject does not, **FN** where the query is
+aberrant and disagrees. The other two columns, `cnv` and `ccf`, are only
+FP/FN-labelled where `status == "TP"`; elsewhere they report `SAME`/`DIFF`,
+because a copy-number difference inside a region whose state is already wrong is
+not independently informative.
+
+Four rollups come with it:
+
+```{r status-stats}
+cmp$stats
+
+cmp$summary
+```
+
+The accurate caller lands 97.3% of shared base pairs as TP, with the 2.7%
+remainder being the four sliver regions its shifted boundaries create -- exactly
+the four boundaries, each off by 150-250 kb.
+
+### Advantages and limitations
+
+* The `table` is the raw material for `getJaccardIndex()`, and worth keeping.
+* `summary` excludes chrX and chrY, which is usually the desired behaviour and
+  occasionally not.
+* It compares only the **intersection**. Genome that one object covers and the
+  other does not simply does not appear, so a caller that reports very few
+  segments is not penalised here for its silence -- `getJaccardIndex()` is where
+  that shows up.
+
+## `getJaccardIndex()` -- base-pair Jaccard on the altered genome
+
+### What it measures
+
+Collapses the `compareSegmentStatus()` table into a handful of genome-wide
+scalars about the **altered** fraction only, treating the subject as truth. The
+neutral genome is excluded entirely, which is what makes this immune to the
+"mostly-neutral genome" problem that Part 2 spends so long on -- there is no
+credit here for correctly calling nothing.
+
+\deqn{J = \frac{TP}{Truth + Predicted - TP}, \qquad Dice = \frac{2\,TP}{Truth + Predicted}}
+
+For the target-based counterpart, see `getBinJaccardIndex()` in Part 2, which
+reports the same two coefficients over an evidence grid instead of base pairs.
+
+### Intuition
+
+```{r fig-bpjaccard, fig.height = 4.4, fig.cap = "Base-pair Jaccard on the altered genome, with the two directional fractions it decomposes into. Precision and recall separate the conservative caller's silence from the shifted caller's misplacement."}
+bp_jac <- dplyr::bind_rows(lapply(names(caller_objs), function(nm) {
+  g <- getJaccardIndex(compareSegmentStatus(caller_objs[[nm]], reference_obj))
+  data.frame(
+    Caller = nm,
+    Jaccard = g$jaccard,
+    `Precision (of what it called, how much is real)` =
+      g$matched_query_altered_genome,
+    `Recall (of what was real, how much it found)` =
+      g$matched_subject_altered_genome,
+    check.names = FALSE
+  )
+}))
+
+bp_long <- tidyr::pivot_longer(bp_jac, -Caller,
+  names_to = "Measure", values_to = "Value"
+)
+bp_long$Caller <- factor(bp_long$Caller, levels = rev(names(caller_objs)))
+
+ggplot(bp_long, aes(x = Value, y = Caller, fill = Measure)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.72) +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_fill_manual(values = c("grey35", "#D7301F", "#2B8CBE")) +
+  labs(
+    title = "Base-pair agreement over the altered genome only",
+    subtitle = wrapSub("Neutral genome is excluded, so there is no credit for calling nothing"),
+    x = NULL
+  ) +
+  theme_slide() +
+  guides(fill = guide_legend(nrow = 3))
+```
+
+### How to use it
+
+```{r bpjaccard-use}
+unlist(getJaccardIndex(cmp))
+```
+
+The three directional numbers are the useful ones. `matched_query_altered_genome`
+is a precision -- of the base pairs this caller called altered, what fraction the
+truth agrees about. `matched_subject_altered_genome` is a recall. The Jaccard is
+the single number that combines them, and Sørensen-Dice is the same information
+weighted differently.
+
+The four callers separate cleanly, and in a way none of the bin metrics quite
+managed:
+
+* **Accurate**: J = 0.92, precision 1.00, recall 0.92. Everything it called is
+  real; it slightly under-reaches.
+* **Fragmented**: J = 0.89, precision 1.00, recall 0.89. Almost the same
+  numbers -- because this metric is entirely blind to how many pieces the
+  altered genome was delivered in. Compare `computeFragmentation()`, which sees
+  nothing but that.
+* **Conservative**: J = 0.30, precision 1.00, recall 0.30. Perfect precision and
+  a catastrophic recall is the signature of under-calling. Precision alone would
+  have made this the best caller of the four.
+* **Shifted**: J = 0.52, precision 0.69, recall 0.67. The only caller that loses
+  on both, which is what misplacement does -- its altered base pairs are both
+  wrong and missing.
+
+### Advantages and limitations
+
+* Excluding the neutral genome removes the single biggest source of inflated
+  agreement scores, at no cost in interpretability.
+* Precision and recall are reported separately and should always be read that
+  way; the Jaccard alone cannot tell under-calling from misplacement.
+* Base pairs, not targets. On capture data prefer `annotateBinJaccard()` and
+  `computeEventRecovery()`.
+* Inherits the intersection-only behaviour of `compareSegmentStatus()`.
+
+## `compareSegmentOverlap()` -- per-segment base-pair Jaccard
+
+### What it measures
+
+The base-pair counterpart of `annotateBinJaccard()`. For each segment on both
+sides it finds the best-overlapping counterpart, grouped by state, and attaches
+`jaccard.index` and `jaccard.status`.
+
+### How to use it
+
+```{r overlap-use}
+ov <- compareSegmentOverlap(caller_objs[["Accurate caller"]], reference_obj)
+
+as.data.frame(mcols(ov$query))[, c(
+  "cnv.annotation", "jaccard.index",
+  "jaccard.status"
+)]
+```
+
+Note the difference from `annotateBinJaccard()`: the Jaccard is computed **per
+state**, so `jaccard.status` is the state that won rather than the state of the
+winning segment, and segments with no overlap are labelled `"NO_OVERLAP"` rather
+than given `NA`.
+
+### When to use which
+
+Reach for this one on whole-genome data, or for a quick per-segment annotation
+without having to supply an evidence grid. Reach for `annotateBinJaccard()` on
+capture data, or when the three target counts that distinguish a merge from a
+split are needed. On the toy capture panel here the two disagree,
+and the target-based answer is the trustworthy one -- the base-pair scores are
+inflated by the 2 Mb desert that no caller had evidence in.
+
+## `cnvMetrics()` -- per-state similarity across a cohort
+
+### What it measures
+
+All pairwise Sørensen-Dice overlaps within a list of `cnvstrml` objects,
+computed **separately for each copy-number state** via the `r Biocpkg("CNVMetrics")` package.
+Where `getJaccardIndex()` gives one number for the altered genome, this gives one
+number per state per pair, which is what is needed when the question is *which
+kind* of event the callers disagree about.
+
+### Intuition
+
+```{r fig-cnvmetrics, fig.height = 4.6, fig.cap = "Pairwise Sorensen-Dice per state. The blank cells are not zeroes: the conservative caller reports no deletion at all, so no deletion overlap is defined for it."}
+mm <- cnvMetrics(c(list(Reference = reference_obj), caller_objs))
+
+mm_long <- tidyr::pivot_longer(
+  mm,
+  cols = -c("state", "sample"),
+  names_to = "other", values_to = "dice"
+)
+mm_long <- dplyr::filter(mm_long, sample != other)
+mm_long$sample <- factor(mm_long$sample, levels = names(mm)[-(1:2)])
+mm_long$other <- factor(mm_long$other, levels = rev(names(mm)[-(1:2)]))
+
+short <- function(x) sub(" caller", "", x)
+
+ggplot(mm_long, aes(x = sample, y = other, fill = dice)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  facet_wrap(~state) +
+  scale_fill_gradient2(
+    low = "#D7301F", mid = "#FEE08B", high = "#1A9850",
+    midpoint = 0.5, limits = c(0, 1),
+    name = "Sorensen-Dice", na.value = "grey90"
+  ) +
+  scale_x_discrete(labels = short) +
+  scale_y_discrete(labels = short) +
+  labs(
+    title = "Where the disagreement lives, state by state",
+    subtitle = wrapSub("Grey = the state is absent from one of the two profiles, which is not zero"),
+    x = NULL, y = NULL
+  ) +
+  theme_slide() +
+  guides(fill = guide_colourbar(
+    title.position = "top", title.hjust = 0.5,
+    barwidth = grid::unit(10, "lines"),
+    barheight = grid::unit(0.7, "lines")
+  )) +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    legend.title = element_text()
+  )
+```
+
+### How to use it
+
+```{r cnvmetrics-use}
+dplyr::filter(mm, sample == "Reference")[, c(
+  "state", "Accurate caller",
+  "Conservative caller"
+)]
+```
+
+`simplify = TRUE` (the default) folds `AMP-LOH` into `AMP`, `NEUT-LOH` into
+`NEUT` and both deletion states into `DEL`, which is usually what makes profiles
+comparable across callers that do not all resolve LOH. Pass `simplify = FALSE`
+to keep them apart.
+
+### Advantages and limitations
+
+* Per-state resolution is the point: the conservative caller scores 0.67 on AMP
+  against the reference and is *undefined* on DEL, and that pair of facts is a
+  complete diagnosis.
+* The whole cohort in one call, so it is the natural input to a clustering or
+  outlier screen across many samples.
+* `NA` means "this state does not occur in one of the two profiles", which is
+  emphatically not zero. Aggregating with `na.rm = TRUE` will silently reward a
+  caller for never reporting a state -- the conservative caller's mean over
+  defined states is *better* than the fragmented caller's.
+* Base-pair based, and includes the neutral state, so the `NEUT` row is subject
+  to exactly the inflation Part 2 warns about. Read the `AMP` and `DEL` panels.
+
+## `cnvEntropy()` -- how complex is the profile?
+
+### What it measures
+
+The conditional entropy of the copy-number values across a common set of
+segments. It is a **complexity** measure, not an accuracy measure: it takes no
+reference, and answers "how much information is in this profile" rather than "is
+this profile right".
+
+Because entropy is only comparable across samples evaluated on the same
+segments, the input must be a consensus object from `findConsensus()` -- or a
+single object plus a `targets` grid.
+
+### How to use it
+
+```{r entropy-use}
+consensus <- findConsensus(c(list(Reference = reference_obj), caller_objs))
+
+cnvEntropy(consensus, targets = targets)
+```
+
+### The trap worth spelling out
+
+Read those numbers against the known behaviour of each caller. The reference
+scores 0.58. The fragmented and shifted callers also score 0.58. And the
+**conservative** caller -- the one that missed an entire deletion -- scores
+**0.43, the lowest and therefore apparently the cleanest of the five.**
+
+That is not a defect in the function; it is what the function measures. A caller
+that reports less has a simpler profile, and a simpler profile has lower
+entropy. Entropy detects the *opposite* failure -- shattering, noise,
+over-segmentation -- and detects it well. Used as a one-sided screen for
+abnormally **high** entropy it is a good QC metric. Used as a ranking it will
+select the caller that does least.
+
+### Advantages and limitations
+
+* No reference needed, and one number per sample, so it screens a cohort cheaply
+  for over-segmentation and noise.
+* Sensitive to genuine biology as well as artefact -- a chromothriptic sample is
+  legitimately high-entropy. Compare within a cohort, not against an absolute
+  threshold.
+* Monotone in "reports less is better", as above. Never rank on it.
+* Passing a list of `cnvstrml` objects is documented but not currently
+  supported; wrap them with `findConsensus()` first, as here.
+
+## `computeStateSizes()` and `computeStateWeights()`
+
+### What they do
+
+Two small utilities rather than metrics. `computeStateSizes()` reports the total
+base pairs a `cnvstrml` object assigns to each of NEUTRAL, AMP, HETDEL and
+HOMDEL -- derived from `total.allele.copies`, not from `cnv.annotation`.
+`computeStateWeights()` takes two such vectors and returns their per-state mean,
+for use as weights when averaging a per-state metric into one number.
+
+```{r statesizes-use}
+sapply(c(list(Reference = reference_obj), caller_objs), computeStateSizes)
+
+computeStateWeights(
+  truth_sizes  = computeStateSizes(reference_obj),
+  method_sizes = computeStateSizes(caller_objs[["Conservative caller"]])
+)
+```
+
+### When to use them
+
+`computeStateSizes()` is a useful sanity check in its own right -- the
+conservative caller's `HETDEL = 0` is the missed deletion, stated as plainly as
+it can be. `computeStateWeights()` exists so that a per-state table such as
+`cnvMetrics()` output can be collapsed with weights that reflect how much genome
+each state actually occupies, rather than giving a 40 kb homozygous deletion the
+same vote as a 20 Mb neutral stretch.
+
+Both are thin wrappers with no chance-correction and no notion of position. They
+key off exact copy numbers, so a whole-genome-doubled sample where neutral is
+four copies will report `NEUTRAL = 0`.
+
+# Part 7 -- Choosing between segmentations of one sample: information criteria
+
+Parts 2 to 6 all need something to compare against -- a truth, or a family of
+peers. The five functions here need neither. They score a single segmentation
+against the **bin-level log-ratios it was fitted to**, trading goodness-of-fit
+against the number of segments used, in the manner of AIC and BIC. Lower is
+better in every case.
+
+This is the right tool for one specific job: one caller has been run at several
+sensitivity settings on one sample, and the question is which output to keep.
+
+## The five variants
+
+```{r ic-table}
+ic_scores <- dplyr::bind_rows(lapply(names(caller_objs), function(nm) {
+  segs <- addChromosomeAnnotation(caller_objs[[nm]]@segments, "hg38")
+  data.frame(
+    Caller       = nm,
+    Segments     = length(segs),
+    BIC          = computeBIC(bins, segs)$BIC,
+    mBIC_seg     = computeMBICseg(bins, segs)$mBIC_seg,
+    CVIC         = computeCVIC(bins, segs)$CVIC,
+    MSQBIC       = computeMSQBIC(bins, segs)$MSQBIC,
+    adaptive_BIC = computeAdaptiveBIC(bins, segs)$adaptive_BIC
+  )
+}))
+
+ic_scores
+```
+
+* `computeBIC()` -- the baseline. Weighted BIC over log-ratio fit, optionally
+  combined with allele-fraction evidence (`baf = TRUE`, the default). Also
+  returns `AIC`, `AICc` and the components.
+* `computeMBICseg()` -- BIC with a penalty that scales with segment
+  characteristics rather than counting segments equally, so many short segments
+  cost more than a few long ones.
+* `computeCVIC()` -- replaces the analytic penalty with k-fold cross-validated
+  prediction error over the bins. Fewer assumptions, more compute.
+* `computeMSQBIC()` -- adds a per-segment quality penalty, charging extra for
+  segments whose bins fit them poorly.
+* `computeAdaptiveBIC()` -- derives the penalty strength from the data rather
+  than fixing it, and reports the `penalty_reduction` it settled on.
+
+### Two preconditions that are easy to miss
+
+```{r ic-preconditions, eval = FALSE}
+# 1. Segments must carry an `arm` column, or every segment is silently dropped
+#    and you get "No overlapping bins between 'bins' and 'segments'".
+segs <- addChromosomeAnnotation(obj@segments, "hg38")
+
+# 2. With the default baf = TRUE, segments need the allele-count columns.
+#    Pass baf = FALSE to score on log-ratio alone.
+computeBIC(bins, segs, baf = FALSE)
+```
+
+### Intuition, and the warning that goes with it
+
+```{r fig-ic, fig.height = 4.6, fig.cap = "Every criterion except mBIC_seg ranks the conservative caller -- the one that missed an entire deletion -- as the best segmentation of the sample. Information criteria reward parsimony; they cannot see a missed event."}
+ic_long <- tidyr::pivot_longer(ic_scores, -c("Caller", "Segments"),
+  names_to = "Criterion", values_to = "Score"
+)
+ic_long <- dplyr::group_by(ic_long, Criterion)
+ic_long <- dplyr::mutate(ic_long, Rank = rank(Score))
+ic_long <- dplyr::ungroup(ic_long)
+ic_long$Caller <- factor(ic_long$Caller, levels = rev(names(caller_objs)))
+
+ggplot(ic_long, aes(x = Criterion, y = Caller, fill = Rank)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = sprintf("%.1f", Score)), size = 4.2) +
+  scale_fill_gradient(
+    low = "#1A9850", high = "#D7301F",
+    breaks = 1:4, name = "Rank (1 = best)"
+  ) +
+  labs(
+    title = "What the information criteria prefer",
+    subtitle = wrapSub("Green = ranked best by that criterion. Only mBIC_seg picks the accurate caller."),
+    x = NULL, y = NULL
+  ) +
+  theme_slide() +
+  guides(fill = guide_colourbar(
+    title.position = "top", title.hjust = 0.5,
+    barwidth = grid::unit(9, "lines"),
+    barheight = grid::unit(0.7, "lines")
+  )) +
+  theme(legend.title = element_text())
+```
+
+This figure is the reason this part comes with a warning rather than a
+recommendation. The **conservative caller wins on four of the five criteria** --
+BIC 28.2 against the accurate caller's 49.4 -- because it uses four segments
+instead of six and the criteria charge for segments. It also misses a 4 Mb
+deletion entirely, and no information criterion can know that, because the only
+evidence they consult is how well the segments fit the log-ratios, and a segment
+that is not there fits nothing.
+
+`mBIC_seg` is the exception, ranking the accurate caller first (2.32) ahead of
+the conservative one (2.53), because its penalty is segment-aware rather than a
+flat per-segment charge. Do not over-read one toy example, but the ordering is
+consistent with what the modified penalty is designed to do.
+
+### When to use them
+
+Within one caller, across settings, on one sample. That is the comparison these
+were built for, and there they are genuinely useful: the fragmented caller is
+penalised hard by all five (BIC 117.6), so a sensitivity sweep will find its way
+back down.
+
+### Limitations
+
+* **Blind to false negatives.** As above. Never use an information criterion to
+  choose between callers, and never as a quality score against a truth -- that is
+  what Parts 2 to 5 are for.
+* Comparable only across segmentations of the **same bins**. The scores are not
+  transferable between samples, bin sizes, or `baf` settings.
+* `computeBIC()`'s many switches (`noisy`, `strict_bic`, `winsorize`,
+  `size_weighted_penalty`) change the value materially. Fix them once and record
+  which were used.
+* The `arm` and allele-column preconditions above fail confusingly rather than
+  loudly.
+
+# Part 8 -- Rolling up and running everything at once
+
+## The rollup functions
+
+The three `summarise*()` functions take the per-segment tables of Part 4, coerced
+to plain data frames, and reduce them to one row per group. They sit on a
+data-frame boundary with no dependency on the `GRanges` layer, so they also work
+on per-segment tables written out by an earlier run of a pipeline.
+
+```{r rollups}
+seg_df <- bind_rows(lapply(names(callers), function(nm) {
+  scored <- annotateBinStateConcordance(callers[[nm]], reference, bins = targets)
+  overlapped <- annotateBinJaccard(callers[[nm]], reference, bins = targets)
+  df <- as.data.frame(scored)
+  df$bin.jaccard.index <- mcols(overlapped$query)$bin.jaccard.index
+  df$caller <- nm
+  df
+}))
+
+summariseSegmentJaccard(seg_df,
+  group_cols = "caller",
+  value_cols = "bin.jaccard.index"
+)
+
+summariseStateConcordance(seg_df, group_cols = "caller")
+
+summariseBreakpointConsistency(consistency)
+```
+
+`summariseSegmentJaccard()` reports five numbers per column rather than a mean,
+because this distribution is typically bimodal -- segments that matched well and
+segments that did not match at all. The median resists the tail; the weighted
+mean says whether the failures sit in small segments or large ones;
+`frac_ge_threshold` counts how many segments are *usable* rather than how good
+the average is; and `frac_no_overlap` isolates the segments with no counterpart
+at all, which is a different failure and is invisible in every other statistic.
+
+`summariseStateConcordance()` deliberately reports two accuracies.
+`state_concordance_pooled` sums the counters across segments before dividing --
+every target counts once, which is what a downstream user of the calls
+experiences. `state_concordance_mean` averages the per-segment fractions, giving
+every segment equal say regardless of size, which indicates whether the
+*segments* are individually trustworthy. A caller with three enormous correct
+segments and forty tiny wrong ones scores well on the first and badly on the
+second, and both readings are true.
+
+## `segmentationMetrics()` -- the one call to make
+
+### What it does
+
+Runs all of the Part 2 and Part 3 metrics for one query/subject pair and flattens
+them into a single row.
+
+```{r driver}
+all_metrics <- bind_rows(lapply(names(callers), function(nm) {
+  cbind(
+    caller = nm,
+    segmentationMetrics(callers[[nm]], reference, bins = targets)
+  )
+}))
+
+all_metrics[, c(
+  "caller", "kappa", "recall_altered", "precision_altered",
+  "boundary_f1", "ari_segment", "nvi_segment",
+  "mean_query_per_subject"
+)]
+```
+
+### Intuition
+
+```{r fig-driver, fig.height = 5.0, fig.cap = "The whole comparison in one picture. Each caller fails on a different axis, and no single column would have ranked them fairly."}
+panel <- all_metrics[, c(
+  "caller", "kappa", "recall_altered",
+  "precision_altered", "boundary_f1", "ari_segment"
+)]
+panel_long <- tidyr::pivot_longer(panel, -caller,
+  names_to = "Metric",
+  values_to = "Score"
+)
+panel_long$Metric <- factor(
+  panel_long$Metric,
+  levels = c(
+    "kappa", "recall_altered", "precision_altered",
+    "boundary_f1", "ari_segment"
+  ),
+  labels = c(
+    "State agreement\n(kappa)", "Event recall", "Event precision",
+    "Boundary F1", "Structural agreement\n(ARI)"
+  )
+)
+panel_long$caller <- factor(panel_long$caller, levels = rev(names(callers)))
+# Clamp only the colour, never the printed value: ARI can legitimately go below 0.
+panel_long$Shade <- pmin(pmax(panel_long$Score, 0), 1)
+
+ggplot(panel_long, aes(x = Metric, y = caller, fill = Shade)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = sprintf("%.2f", Score)), size = 5) +
+  scale_fill_gradient2(
+    low = "#D7301F", mid = "#FEE08B", high = "#1A9850",
+    midpoint = 0.5, limits = c(0, 1), guide = "none"
+  ) +
+  labs(
+    title = "Four callers, five questions",
+    x = NULL, y = NULL
+  ) +
+  theme_slide() +
+  theme(panel.grid = element_blank())
+```
+
+### Why prefer it over calling the metrics individually
+
+Because **the returned column set never depends on the input**. Every metric
+contributes its columns whether it succeeded, failed or was skipped; a failure
+logs a warning and contributes `NA`. An empty segmentation, a single-segment one
+and a real pair all return the same one-row shape, so `bind_rows()` over a whole
+sweep can never produce a ragged frame. Assembling the calls by hand is not
+wrong, but it leaves each call site to decide what to do when a metric fails,
+which is how a benchmark ends up with a result table whose columns depend on
+which settings happened to work.
+
+ARI and VI appear twice each, as `ari_segment`/`ari_state` and
+`vi_segment`/`vi_state`, never as a bare `ari` or `vi`. The two partitions answer
+different questions, and a column name that does not say which is a trap for
+whoever reads the table next.
+
+### What is not included
+
+The per-segment annotators of Part 4 return a segmentation rather than a row,
+and the truth-free metrics of Part 5 take a family rather than a pair. Call
+those separately.
+
+### The `bins` argument
+
+One `bins` argument serves both kinds of metric. When it is `NULL` the state
+metrics -- which require a real evidence grid -- are skipped with a warning, and
+only the geometry metrics run on an auto-tiled grid. Pass the capture targets to
+get everything.
+
+# Choosing a metric
+
+The table below is sortable by any column and has a search box; the default order
+follows the running order of the vignette rather than any ranking. `Input` names
+what the metric consumes: `bins` for a bin-level log-ratio table, `targets` for an
+evidence grid, `segments` for segment boundaries only, and `base pairs` for
+`cnvstrml` objects compared without a grid.
+
+```{r metric-table, echo = FALSE}
+metric_guide <- data.frame(
+  Question = c(
+    "Is the data too noisy to segment?", "Is the capture uneven?",
+    "Per-target depth from a BAM", "Overall, how good is this call set?",
+    "What would doing nothing have scored?", "Which states does it confuse?",
+    "Does it miss events or invent them?",
+    "How much of the altered genome matched (bins)?",
+    "Are the transitions in the right place?",
+    "Does it agree on segment granularity?",
+    "A distance between segmentations", "Is it splitting or merging?",
+    "Which segments can be trusted (state)?",
+    "Which segments can be trusted (position)?",
+    "Which boundaries are reproducible?",
+    "Do the callers see the same thing?", "Which caller is the outlier?",
+    "Region-level TP/FP/FN contingency",
+    "How much of the altered genome matched (base pairs)?",
+    "Same as position, on whole-genome data",
+    "Which <em>state</em> do the callers disagree on?",
+    "How complex is this profile?", "Base pairs per copy-number state",
+    "Which setting segmented best?", "All of the above, one row"
+  ),
+  Function = c(
+    "<code>computeMAPD()</code>", "<code>computeGini()</code>",
+    "<code>computeCoverage()</code>", "<code>computeStateKappa()</code>",
+    "<code>scoreNullCaller()</code>", "<code>computeStateConfusion()</code>",
+    "<code>computeEventRecovery()</code>",
+    "<code>getBinJaccardIndex()</code>",
+    "<code>computeBoundaryConcordance()</code>",
+    "<code>computeSegmentationARI()</code>",
+    "<code>computeSegmentationVI()</code>",
+    "<code>computeFragmentation()</code>",
+    "<code>annotateBinStateConcordance()</code>",
+    "<code>annotateBinJaccard()</code>",
+    "<code>computeBreakpointConsistency()</code>",
+    "<code>computeCallerAgreement()</code>",
+    "<code>computeConsensusAgreement()</code>",
+    "<code>compareSegmentStatus()</code>", "<code>getJaccardIndex()</code>",
+    "<code>compareSegmentOverlap()</code>", "<code>cnvMetrics()</code>",
+    "<code>cnvEntropy()</code>", "<code>computeStateSizes()</code>",
+    "<code>computeBIC()</code> and friends",
+    "<code>segmentationMetrics()</code>"
+  ),
+  `Needs a truth?` = c(
+    "no", "no", "no", "yes", "yes", "yes", "yes", "yes", "yes", "yes", "yes",
+    "yes", "yes", "yes", "no", "no", "no", "yes", "yes", "yes", "no", "no",
+    "no", "no", "yes"
+  ),
+  Input = c(
+    "bins", "bins", "BAM + BED", "targets", "targets", "targets", "targets",
+    "targets", "segments", "targets", "targets", "targets", "targets",
+    "targets", "segments", "targets", "targets", "base pairs", "base pairs",
+    "base pairs", "base pairs", "targets", "segments", "bins", "targets"
+  ),
+  Part = c(
+    1L, 1L, 1L, 2L, 2L, 2L, 2L, 2L, 3L, 3L, 3L, 3L, 4L, 4L, 4L, 5L, 5L, 6L,
+    6L, 6L, 6L, 6L, 6L, 7L, 8L
+  ),
+  check.names      = FALSE,
+  stringsAsFactors = FALSE
+)
+
+DT::datatable(
+  metric_guide,
+  rownames = FALSE,
+  escape = FALSE,
+  options = list(
+    pageLength = 25,
+    lengthMenu = list(c(10, 25, -1), c("10", "25", "All")),
+    columnDefs = list(list(className = "dt-left", targets = "_all"))
+  )
+)
+```
+
+A short recipe for the common cases:
+
+* **Benchmarking against simulated truth.** `segmentationMetrics()` for the
+  table, `scoreNullCaller()` once per sample for the floor, and
+  `computeStateConfusion()` on whatever comes out badly.
+* **Tuning one caller's parameters.** `computeStateKappa()` to rank,
+  `computeFragmentation()` and `computeBoundaryConcordance()` to decide which
+  way to turn the knob.
+* **Real samples, several callers, no truth.** `computeCallerAgreement()` for a
+  per-sample flag, `computeConsensusAgreement()` to pick an output,
+  `computeBreakpointConsistency()` to find the coordinates worth trusting.
+* **Deciding which individual calls to report.**
+  `annotateBinStateConcordance()` and `annotateBinJaccard()`, then filter.
+* **Before any of the above.** `computeMAPD()` and `computeGini()` on the bin
+  file. A sample that fails here will not be rescued by a better caller.
+* **Tuning one caller on one sample, no truth.** `computeMBICseg()` to rank the
+  settings, `cnvEntropy()` as a one-sided screen for over-segmentation -- and
+  read the warnings in Parts 6 and 7 first, because both metrics reward a caller
+  for reporting less.
+
+## A closing caution
+
+Three habits guard against most of the ways these numbers mislead:
+
+1. **Always pass a real evidence grid.** On capture data, `bins` should be the
+   target regions. A uniform base-pair tiling of an exome measures agreement
+   over territory nobody sequenced.
+2. **Never read a raw agreement without its null.** `scoreNullCaller()` costs
+   nothing and reframes every "fraction of genome concordant" figure that will
+   ever be presented.
+3. **Never rank on a truth-free metric alone.** Agreement measures typicality.
+   Where callers share a blind spot, or where the sample is unsolvable, the
+   consensus is wrong and the metric will confidently indicate otherwise.
+
+# Session info
+
+```{r sessionInfo, echo = FALSE}
+sessionInfo()
+```

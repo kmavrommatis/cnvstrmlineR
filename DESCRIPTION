@@ -1,0 +1,83 @@
+Package: cnvstrmliner
+Type: Package
+Title: Parser and Utilities for managing results from various CNV calling tools
+Version: 0.1.185
+Authors@R:
+    person("Konstantinos", "Mavrommatis",
+           email = "konstantinos.mavrommatis@bms.com",
+           role = c("aut", "cre"))
+URL: https://github.com/kmavrommatis/cnvstrmlineR,
+    https://kmavrommatis.github.io/cnvstrmlineR/
+BugReports: https://github.com/kmavrommatis/cnvstrmlineR/issues
+Description: CNV streamliner.
+    The aim of this package is to streamline the analysis of results produced by CNV tools. 
+    It introduces the cnvstrml object and parsers for commonly used methods.
+    Inputs:
+    It has some methods to compare different calls.
+    Available support for
+    FACETS, PureCN, SCLUST, Sequenza, GATK CopyNumber, ControlFreec (without subclones), Battenberg, CNVkit, SEG (Generic input file for IGV).
+    Outputs:
+    VCF (v4.2 compliant), SEG, GISTIC2.0 segment files.
+    Visualization: 
+    This package contains methods to visualize the segments 
+    of a genome or of a choromosme 
+    or a cohort of samples
+    Metrics:
+    It also provides metrics for the segmentation result and allows to compare
+    CNV calls among samples using standard CNV metrics.
+    Using the CNAQC package it provides a PASS/FAIL result for the sample and for
+    each segment.
+License: GPL (>= 3)
+Encoding: UTF-8
+LazyData: true
+RoxygenNote: 7.3.3
+Roxygen: list(markdown = TRUE)
+Depends: R (>= 4.2.0)
+biocViews: CopyNumberVariation, Sequencing, Software
+Remotes: caravagnalab/CNAqc
+Imports: 
+    data.table,
+    future,
+    future.apply,
+    listenv,
+    magrittr,
+    dplyr,
+    tidyr,
+    tibble,
+    BiocGenerics,
+    S4Vectors,
+    GenomeInfoDb,
+    SummarizedExperiment,
+    GenomicRanges,
+    IRanges,
+    VariantAnnotation,
+    CNVMetrics,
+    infotheo,
+    matrixStats,
+    patchwork,
+    fs,
+    logger,
+    CNAqc,
+    methods,
+    rlang,
+    StructuralVariantAnnotation,
+    stringi,
+    stringr,
+    purrr,
+    tidyselect,
+    ineq,
+    bamsignals,
+    Rsamtools,
+    ggplot2,
+    canvasXpress,
+    stats,
+    utils
+Suggests:
+    knitr,
+    rmarkdown,
+    BiocStyle,
+    AnnotationHub,
+    DT,
+    ensembldb,
+    rtracklayer
+VignetteBuilder: knitr

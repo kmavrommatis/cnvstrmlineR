@@ -1,0 +1,874 @@
+---
+title: "Introduction to cnvstrmliner"
+author:
+- name: Konstantinos Mavrommatis
+  affiliation: Bristol Myers Squibb
+  email: konstantinos.mavrommatis@bms.com
+package: cnvstrmliner
+output:
+  BiocStyle::html_document:
+    toc_float: true
+    code_folding: show
+bibliography: references.bib
+abstract: |
+  `cnvstrmliner` reads the output of commonly used copy-number callers into a
+  single S4 container, the `cnvstrml` object, and provides a uniform set of
+  summary, annotation, export and quality-control functions on top of it. This
+  vignette follows one whole-exome breast tumour sample through a complete
+  analysis with a single caller (FACETS): parsing, tabular and graphical
+  summaries, VCF and SEG/GISTIC export, gene-level annotation, and CNAqc-based
+  quality control. The individual parsers are covered in
+  *Parsing CNV caller outputs*, and the agreement metrics in
+  *Comparing CNV segmentations*.
+vignette: |
+  %\VignetteIndexEntry{Introduction to cnvstrmliner}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  crop = NULL,
+  cache = TRUE,
+  fig.width = 10,
+  fig.height = 4
+)
+```
+
+```{r setup, message = FALSE}
+library(cnvstrmliner)
+library(logger)
+library(future)
+library(GenomicRanges)
+library(GenomeInfoDb)
+library(rtracklayer)
+library(DT)
+log_threshold(level = INFO, namespace = "cnvstrmliner")
+```
+
+# Introduction
+
+The proliferation of Next-Generation Sequencing (NGS) tools for predicting 
+Copy Number Aberrations (CNAs) has led to a significant data integration 
+challenge in bioinformatics. Each application, while serving the same core purpose, 
+generates results in a unique output format, often spread across multiple files. 
+Furthermore, the specific metrics and fields reported—such as segment start/end positions, 
+log-ratio values, and associated p-values—are frequently named differently or 
+are not uniformly present across all tool outputs. 
+This lack of standardization creates substantial overhead for researchers, 
+who must write custom parsing scripts for every new tool, leading to complex 
+and error-prone downstream analysis. It is exceptionally difficult to compare 
+results across different methods, integrate them into common analysis pipelines, 
+or use them with existing visualization and interpretation software, 
+even when using semi-standard formats like SEG or VCF which haven't achieved universal adoption.
+
+A dedicated package capable of reading the diverse outputs of CNA prediction tools 
+and translating them into a single, common, standardized format is crucial for 
+streamlining genomic data analysis. Such a package would significantly reduce 
+the need for custom scripting, allowing researchers to focus on biological 
+interpretation rather than data wrangling. By providing a consistent data 
+structure, it would immediately enable method comparison, consensus calling, 
+and seamless integration with downstream analysis and visualization tools, 
+irrespective of the initial prediction method. This unified approach promotes 
+reproducibility and interoperability across different studies and laboratories, 
+ultimately accelerating the pace of discovery in cancer genomics and other fields 
+relying on CNA analysis.
+
+`cnvstrmliner` is a package that tries to assume the role of this middle layer
+that is capable of parsing multiple output formats and provide a single uniform one 
+using standard Bioconductor objects.
+Furthermore, some additional functionality is added to facilitate the comparisons and 
+QC.
+
+## The example dataset
+
+All the examples below use a single sample, **`BRCA_XX_01_pur30_T`**, distributed with
+the package under `extdata/example_CNV/BRCA_XX_01`. It is a simulated breast tumour with
+a matched normal, diluted to a nominal 30% tumour purity and processed through five CNV
+callers. This vignette uses the FACETS output only; the other four appear in the
+*Parsing CNV caller outputs* vignette.
+
+This is a **whole-exome (WES)** sample, captured with the Agilent SureSelect Human All
+Exon V6 kit. That matters throughout: the callers only see the captured intervals, so
+segment boundaries are constrained to the target regions, marker counts per segment are
+far lower than in WGS, and the off-target genome is simply not observed. The coordinates
+of the capture kit are shipped alongside the caller output and are used below wherever a
+common set of genomic intervals is needed.
+
+```{r datadir}
+root <- system.file("extdata/example_CNV/BRCA_XX_01", package = "cnvstrmliner")
+list.dirs(root, recursive = FALSE, full.names = FALSE)
+
+# coordinates of the capture kit used for this sample
+bed.file <- file.path(root, "S07604514_Regions_v6_hg38_Targets.bed.gz")
+```
+
+The companion vignette *Parsing CNV caller outputs* concentrates on the parsers and on
+plotting; this one follows a single sample through a whole analysis: load, summarise,
+annotate, export, and QC.
+
+# The `cnvstrml` object
+
+The package can parse and load data from various CNV callers; `getSupportedMethods()`
+lists the ones currently supported. For each of them `loadCNV()` accepts the output files
+together with a `cnv.method` argument, and a caller-specific `parse<CALLER>()` function is
+also exported (`loadCNV()` is a dispatch function that calls the appropriate one). This
+vignette uses FACETS throughout as the single worked example; the
+*Parsing CNV caller outputs* vignette shows the individual parsers and the quirks of each
+caller's output.
+
+Whichever route is taken, the result is a `cnvstrml` object that contains several slots
+with related information
+Notably the cnvstrmliner object contains some important slots 
+`cnvObj@segments` contains a GRanges object with all the segments and their annotation
+
+The annotation of these GRanges object is uniform and contains the `total.allele.copies`, `major.allele.copies`, 
+`minor.allele.copies` etc as well as the `ccf` and `cf` of each segment.
+If the method provides subclones (e.g. Battenberg or SCLUST) it also provides the copies of Clone1 and Clone2.
+
+In all cases the column `total.allele.copies` contains the total copies in a segment
+`major.allele.copies` the major allele copies and 
+`minor.allele.copies` contains the minor allele copies. 
+(total.allele.copies = minor.allele.copies + major.allele.copies)
+`cnv.loh` is a flag (TRUE/FALSE) indicating if a segment has lost its heterozygosity. 
+In combination with the `cnv.annotation` which contains the type of event (NEUT, AMP, DEL, LOH etc) 
+it provides a uniform way to annotate segments.
+Additionally, when the method provides it the `cnv.cf` and `cnv.ccf` contain the cell fraction (purity)
+and cancer cell fraction respectively.
+Finally, if the method provides it the logR of the segment is stored in the `cnv.lrr` column.
+After qc metrics have been applied the segments also contain the `cnv.cnaqc.pass` flag indicating if the segment passed the CNAqc test or not.
+
+
+Other slots include `cnvObj@purity` with the purity estimated by the method, 
+`cnvObj@ploidy` with the ploidy (which can be a float number) and 
+`cnvObj@effective_ploidy` with the ploidy of the majority of the genome (integer)
+
+Several functions exist to plot and analyse the cnv segments either at the sample or group level.
+`plotSegments()` gives a visual overview of the genome
+
+
+## FACETS
+
+For showing the functionality of the package we will start by loading
+data produced by the FACETS tool [@facets]. Similarly, other callers can be used
+by using the appropriate parser function.
+
+
+Note that although FACETS is designed to work with matched tumor-normal samples,
+cnvstrmliner can also parse FACETS results from unmatched samples. In that case 
+the performance of the tool is not guaranteed to be optimal, but combining the calls from
+multiple unmatched normals against the same tumor sample (see `ensemblCall()`) can improve
+the results.
+
+
+### Load the CNV calls
+
+Load the FACETS result. We typically expect this in a VCF file
+which is provided by the `cnv_facets` pipeline [@cnvfacets].
+FACETS is an R package that produces a dataframe with the same information
+which can be loaded by handing that data frame to `parseFACETS()` directly.
+```{r facets}
+# name of the samples for normal and tumor
+normal_sample <- "BRCA_XX_01_normal_wg"
+tumor_sample <- "BRCA_XX_01_pur30_T"
+
+# location of the example files provided with the package
+cnv.fn <- file.path(
+  root, "FACETS",
+  "BRCA_XX_01_normal_wg-BRCA_XX_01_pur30_T.vcf.gz"
+)
+# somatic mutations of the tumor sample, used by the QC section below
+somatic.fn <- file.path(root, "BRCA_XX_01_pur30_T.somatic-tn.vcf.gz")
+has_somatic <- file.exists(somatic.fn)
+has_somatic
+
+# parse the FACETS result
+# parseCNV() is a dispatch function that calls the appropriate parser synonymous to loadCNV() and readCNV()
+cnv <- parseCNV(
+  cnv.data = cnv.fn,
+  cnv.method = "FACETS",
+  sample = tumor_sample,
+  genome = "hg38"
+)
+# or use the FACETS specific function
+# cnv <- parseFACETS(cnv.fn, sample = tumor_sample)
+cnv
+```
+
+### Summary of the object
+
+The function summaryTable() can provide a summary of the main attributes of the cnvstrmliner object
+at various levels (genome, chromosome arm) per karyotype.
+For more information about the `summaryTable` function see its documentation.
+
+```{r summarytable}
+summaryTable(cnv, level = "genome") %>% DT::datatable()
+
+summaryTable(cnv, level = "chromosome") %>% DT::datatable()
+
+summaryTable(cnv, level = "arm") %>% DT::datatable()
+```
+
+### Visualize the CNV segments
+
+Let's visualize the CNAs for the whole Genome.
+plotSegments() provides a summary plot of the segments called by the method
+across all chromosomes.
+Arms of the chromosomes are shown in alternating colors for better visibility.
+The ploidy of the genome (defined in effective_ploidy slot) is shown as a dashed line.
+Green indicates "normal" (normal = ploidy) segments, red amplifications and blue deletions.
+
+For more information about the function `plotSegments` see its documentation.
+
+
+```{r facets_plot}
+plotSegments(cnv)
+```
+
+# Working with the parsed object
+
+Everything that follows uses the FACETS object parsed above, but none of it is
+FACETS-specific: the same calls work on the output of any supported caller.
+
+## Save the parsed CNV in a VCF file
+
+The parsed object can be saved in a VCF file. This is a rich format that can
+contain all the necessary information about the segments and their annotation.
+The file contains the standard VCF fields as well as the INFO fields
+that describe the CNV segments, and additional INFO fields that are added by cnvstrmliner.
+
+
+```{r savevcf}
+vcf_with_cnvs <- cnvstrmliner::writeVCF(
+  cnv,
+  filename = file.path(tempdir(), paste0(cnv@sample, "_facets_parsed.vcf.gz"))
+)
+```
+
+That file can be read back into an equivalent object with `parseVCF()`, which is what the
+gene annotation section below does.
+
+
+## Orthogonal support from structural variants (SVs)
+
+We can try to associate/correlate CNVs with SVs that are predicted by manta.
+This will return a new object with the segments flagged with sv.support information.
+
+Manta was not run on `BRCA_XX_01`, so there is no SV call set in the example data and the
+chunk below is shown but not executed. Point `manta.fn` at a Manta somatic SV VCF for
+your own sample to reproduce it.
+
+```{r manta, eval = FALSE}
+sv <- parseManta(manta.fn, sample = tumor_sample)
+
+m <- matchCNVSV(cnv, sv, wiggle = 50000)
+m@segments %>% as.data.frame(row.names = NULL)
+```
+
+Segments that are supported by the SV method are more likely to be real.
+However, even in good samples we expect a concordance of ~70% of the segments 
+and in WES this can drop to single digits.
+
+
+## Annotate using the gene symbols
+
+Using `r Biocpkg("AnnotationHub")` we can get the coordinates of the genes
+and annotate the CNV segments wiht them.
+This way we can generate custom gene-level reports or segment-level reports
+like the one below.
+
+This requires the AnnotationHub and ensembldb packages.
+A copy of these commands are provided in the script `annotateGenes.R`
+provided with this package. Note that future releases of EnsDb will not be available
+through this script.
+```{r annotate_segments, cache=TRUE}
+library(AnnotationHub)
+library(ensembldb)
+
+# load the CNV segments from the VCF we just wrote
+cnv <- parseVCF(
+  vcf = vcf_with_cnvs,
+  sample = tumor_sample,
+  genome = "hg38"
+)
+
+# Create a connection to AnnotationHub
+setAnnotationHubOption("CACHE", "~/AnnotationHub") # set a local cache directory
+ah <- AnnotationHub(localHub = dir.exists("~/AnnotationHub"))
+# Query for the Ensembl database for Homo sapiens, release 109 (corresponds to hg38)
+query_results <- query(ah, c("EnsDb", "Homo sapiens", "109"))
+# Load the database
+edb <- query_results[[1]]
+
+
+# Get all genes with their symbols
+genes_hg38 <- genes(edb,
+  columns = c("gene_name", "gene_id"),
+  return.type = "GRanges"
+) %>%
+  as.data.frame() %>%
+  dplyr::mutate(seqnames = dplyr::case_when(
+    seqnames %in% c(seq(1, 22), "X", "Y") ~ paste0("chr", seqnames),
+    seqnames == "M" ~ "MT",
+    TRUE ~ seqnames
+  )) %>%
+  makeGRangesFromDataFrame(., keep.extra.columns = TRUE) %>%
+  keepStandardChromosomes(., pruning.mode = "coarse")
+seqlevels(genes_hg38) <- seqlevels(cnv@segments)
+
+
+# overlap with the segments
+ov <- mergeByOverlaps(
+  query = cnv@segments,
+  subject = genes_hg38
+)
+
+# now show the genes with the annotation of the cnv
+
+subject_ranges <- ov$genes_hg38
+chrom <- seqnames(subject_ranges) %>% as.character()
+st <- start(subject_ranges)
+en <- end(subject_ranges)
+ann <- ov[, c("gene_name", "cnv.annotation", "cnv.loh", "cnv.lrr", "cnv.cf", "total.allele.copies", "major.allele.copies", "minor.allele.copies")] %>% as.data.frame()
+
+gene_level <- cbind(
+  "sample_id" = cnv@sample,
+  "chr" = chrom,
+  "start" = st,
+  "end" = en,
+  "Ploidy" = cnv@effective_ploidy,
+  "B.Allele.Freq" = NA,
+  ann
+) %>%
+  dplyr::rename(
+    Status = cnv.annotation,
+    Ratio = cnv.lrr,
+    Absolute.Copy.Number = total.allele.copies,
+    Sample.Tumor.Purity = cnv.cf,
+    LOH = cnv.loh
+  ) %>%
+  dplyr::select(chr, start, end, gene_name, Status, Ratio, Absolute.Copy.Number, Sample.Tumor.Purity, LOH) %>%
+  dplyr::filter(!is.na(gene_name) & gene_name != "" & Status != "NEUT") %>%
+  dplyr::mutate(
+    chr = stringr::str_remove(chr, "chr"),
+    chr = ifelse(chr == "M", "MT", chr),
+    Status = dplyr::case_when(
+      grepl("NEUT", Status) ~ "Neutral",
+      grepl("HOMDEL", Status) ~ "Deep deletion",
+      grepl("HETDEL", Status) ~ "Shallow deletion",
+      grepl("AMP", Status) ~ "Amplification",
+      TRUE ~ Status
+    ),
+    LOH = dplyr::case_when(
+      (LOH == TRUE & Status == "Neutral") ~ "copy-neutral LOH",
+      (LOH == TRUE & Status == "Shallow deletion") ~ "LOH: loss of heterozygosity",
+      TRUE ~ ""
+    )
+  )
+
+
+segment_level <- cnv@segments %>%
+  as.data.frame(row.names = NULL) %>%
+  dplyr::rename(
+    chr = seqnames,
+    Status = cnv.annotation,
+    Ratio = cnv.lrr,
+    Absolute.Copy.Number = total.allele.copies,
+    Sample.Tumor.Purity = cnv.cf,
+    LOH = cnv.loh
+  ) %>%
+  dplyr::select(chr, start, end, Status, Ratio, Absolute.Copy.Number, Sample.Tumor.Purity, LOH, major.allele.copies, minor.allele.copies) %>%
+  dplyr::filter(Status != "NEUT") %>%
+  dplyr::mutate(
+    chr = stringr::str_remove(chr, "chr"),
+    chr = ifelse(chr == "M", "MT", chr),
+    Genotype = paste0(
+      strrep("A", major.allele.copies),
+      strrep("B", minor.allele.copies)
+    ),
+    Status = dplyr::case_when(
+      grepl("NEUT", Status) ~ "Neutral",
+      grepl("HOMDEL", Status) ~ "Deep deletion",
+      grepl("HETDEL", Status) ~ "Shallow deletion",
+      grepl("AMP", Status) ~ "Amplification",
+      TRUE ~ Status
+    ),
+    LOH = dplyr::case_when(
+      (LOH == TRUE & Status == "Neutral") ~ "copy-neutral LOH",
+      (LOH == TRUE & Status == "Shallow deletion") ~ "LOH: loss of heterozygosity",
+      TRUE ~ ""
+    )
+  ) %>%
+  dplyr::select(-c(major.allele.copies, minor.allele.copies))
+
+head(gene_level)
+head(segment_level)
+
+data.table::fwrite(
+  gene_level,
+  file = file.path(tempdir(), paste0(cnv@sample, "-", cnv@method, ".gene_level.tsv")),
+  append = FALSE,
+  quote = FALSE,
+  sep = "\t"
+)
+
+data.table::fwrite(
+  segment_level,
+  file = file.path(tempdir(), paste0(cnv@sample, "-", cnv@method, ".segment_level.tsv")),
+  append = FALSE,
+  quote = FALSE,
+  sep = "\t"
+)
+```
+
+
+AnnotSV is a separate application that can be used to annotate
+CNAs with the functional elements that are affected.
+Typically it expects a .BED file with the corresponding segments.
+
+The utility function `saveAnnotSV` can be used to prepare 
+a file that we can use to annotate the segments
+
+```{r annotsv}
+annotsv.fn <- file.path(tempdir(), "facets.bed")
+saveAnnotSV(cnv, filename = annotsv.fn)
+```
+
+Now that file contains the information to run AnnotSV.
+
+`cnvstrmliner` does not provide a direct interface to AnnotSV at this point.
+
+
+## Export a cohort for GISTIC
+
+GISTIC2.0 identifies the regions that are recurrently amplified or deleted
+across a cohort, so it expects the segments of all samples in a single
+tab-delimited file. The function `exportGISTIC` produces that file with the
+columns `Sample`, `Chromosome`, `Start`, `End`, `Num_Markers` and `Seg.CN`.
+
+`Seg.CN` is the log2 copy ratio relative to the ploidy of each sample,
+`log2(total.allele.copies / ploidy)`, using the raw fractional ploidy reported
+by the caller. Normalizing by ploidy rather than by 2 means that a
+whole-genome-doubled sample does not appear as a genome-wide gain, which keeps
+the segment means comparable between samples of different ploidy.
+
+```{r gistic}
+gistic.fn <- tempfile(fileext = ".gistic.seg")
+exportGISTIC(gistic.fn, cnv)
+head(read.delim(gistic.fn))
+```
+
+`exportGISTIC` is a preset over `saveSEG`, so the call above is shorthand for
+`saveSEG(gistic.fn, cnv, segmean = "ploidy", minSegCN = -5, dropNA = TRUE, style = "gistic")`.
+Use `saveSEG` directly if you want a different segment mean — for instance
+`segmean = "logR"` with `correct = TRUE` to write purity-corrected log2 ratios
+under the same GISTIC column names.
+
+The same call accepts a list of `cnvstrml` objects to build the cohort file,
+as long as the sample names are unique:
+
+```{r gistic_cohort, eval = FALSE}
+exportGISTIC("cohort.gistic.seg", list(cnv_sample1, cnv_sample2, cnv_sample3))
+```
+
+Segments with a total copy number of 0 would give `log2(0) = -Inf`, which GISTIC
+cannot parse, so they are floored at `minSegCN` (default `-5`). Note also that
+the chromosome names are written exactly as they are stored in the object; most
+GISTIC reference files use unprefixed names (`1`, `2`, ..., `X`), so a `chr`
+prefix may need to be removed first with
+`GenomeInfoDb::seqlevelsStyle(cnv@segments) <- "NCBI"`.
+
+
+## How purity and subclonality affect the segment mean
+
+The four `segmean` modes of `saveSEG` respond very differently to tumor purity
+and to subclonal events, and the choice matters as soon as a cohort mixes
+samples of unequal purity.
+
+To see this without depending on a particular caller, we build synthetic samples
+where we control the truth. A clone occupying a fraction `CCF` of the *tumor*
+cells occupies `cf = purity * CCF` of *all* cells in the sample, so a caller
+measuring that segment against a diploid background would report
+
+$$\text{logR}_{observed} = \log_2\left((1 - cf) + cf \cdot \frac{CN}{ploidy}\right)$$
+
+We construct one object per purity, each holding six segments: two and three
+total copies, at CCF 1.0 (clonal), 0.6 and 0.3.
+
+```{r purity_grid}
+log_threshold(level = WARN, namespace = "cnvstrmliner")
+
+PL <- 2
+grid <- expand.grid(ccf = c(1.0, 0.6, 0.3), cn = c(2, 3))
+
+makeSample <- function(purity) {
+  cf <- purity * grid$ccf
+  lrr <- log2((1 - cf) + cf * grid$cn / PL)
+  gr <- GRanges("chr1", IRanges(
+    start = seq(1e6, by = 2e6, length.out = nrow(grid)),
+    width = 1e6 - 1
+  ))
+  mcols(gr) <- DataFrame(
+    total.allele.copies = grid$cn,
+    major.allele.copies = ifelse(grid$cn == 2, 1, 2),
+    minor.allele.copies = 1,
+    cnv.lrr = lrr,
+    cnv.markers = 100L,
+    cnv.totalmarkers = 200L,
+    cnv.cf = cf
+  )
+  new("cnvstrml",
+    segments = gr, purity = purity, ploidy = PL,
+    sample = sprintf("pur%03d", purity * 100),
+    genome = "hg38", sex = "F", method = "demo"
+  )
+}
+
+samples <- lapply(c(0.30, 0.80, 1.00), makeSample)
+```
+
+Now write the same cohort out in each mode and collect the sixth column:
+
+```{r purity_grid_table}
+segmeanOf <- function(...) {
+  f <- tempfile()
+  saveSEG(f, samples, ...)
+  read.delim(f)$segmean
+}
+
+comparison <- do.call(rbind, lapply(samples, function(X) {
+  d <- as.data.frame(X@segments, row.names = NULL)
+  data.frame(
+    purity = X@purity,
+    CN = d$total.allele.copies,
+    CCF = round(d$cnv.cf / X@purity, 2),
+    lrr_observed = round(d$cnv.lrr, 4)
+  )
+}))
+
+comparison$copies <- segmeanOf()
+comparison$ploidy <- segmeanOf(segmean = "ploidy")
+comparison$logR <- segmeanOf(logR = TRUE)
+comparison$correct <- segmeanOf(logR = TRUE, correct = TRUE)
+comparison$correct_usePurity <- segmeanOf(
+  logR = TRUE, correct = TRUE, usePurity = TRUE
+)
+
+log_threshold(level = INFO, namespace = "cnvstrmliner")
+comparison
+```
+
+Four things to take from that table.
+
+**Two copies against ploidy 2 is invisible in every log-ratio mode.** Two copies
+on a diploid background is no change, so the observed log ratio is 0 at every
+purity and every CCF — and a "subclonal" non-event has no meaning. Only
+`segmean = "copies"` distinguishes such a segment, by writing `2`.
+
+**Uncorrected `logR` is compressed by purity.** For a single-copy gain it follows
+`log2(1 + 0.5 * purity * CCF)`, so a clonal gain reads 0.585 at full purity but
+only 0.2016 at 30%. Comparing raw `logR` across samples of differing purity is
+not a like-for-like comparison.
+
+**`correct = TRUE` discards subclonality.** It divides by the per-segment
+`cnv.cf`, which bundles purity and CCF together, so every three-copy row
+collapses to 0.585: a gain carried by 30% of tumor cells is reported identically
+to a fully clonal one.
+
+**`correct = TRUE` with `usePurity = TRUE` separates the two effects.** Dividing
+by the global purity alone leaves `log2(1 + 0.5 * CCF)`, which depends on CCF but
+not on purity. Compare the purity 0.80 / CCF 0.3 row with purity 0.30 / CCF 0.3:
+both give 0.2016, even though their raw log ratios differ (0.1635 against 0.0635).
+This is the mode to use when subclonality matters.
+
+Note the corollary for `exportGISTIC`: because the `ploidy` mode is derived from
+the fitted integer copy number, a subclonal gain is written at full strength and
+GISTIC cannot distinguish it from a clonal one. That is the price of being
+caller-agnostic and directly comparable across a cohort.
+
+
+## Perform QC on a sample
+
+First we can compare the expected VAF of somatic events to the observed ones, 
+using the `r Githubpkg("caravagnalab/CNAqc")` package.
+We need the somatic mutations that have been called on the tumor sample. Internally
+cnvstrmliner is using `r Biocpkg("VariantAnnotation")` to load and filter the mutations.
+After the function applyQCMetrics finishes the slot cnv@quality$cnaqcobj contains
+the results of running CNAqc.
+There we can find the `peaks_analysis$QC` and `peaks_analysis$score` for a high level score of the 
+cnv quality. A flag == PASS is a good indication that the somatic VAF is within the expected range,
+and a score close to 0 means that the predicted purity is very similar to the expected one.
+Typically absolute score values  > 0.15 indicate problems with the purity estimation.
+
+The mutations can be handed to `applyQCMetrics` either as a file name or as a data frame
+loaded beforehand with `loadMutationsFromVCF()`. That function reads the allelic depths
+from the `AD` field of the sample column, so the VCF must carry a sample named exactly as
+`cnv@sample` (here `BRCA_XX_01_pur30_T`). It keeps only single-nucleotide substitutions
+with a VAF above 0.05 and, with the default `filter = TRUE`, only the calls flagged
+`PASS`. Pass `filter = FALSE` to score every record in the file instead — worth doing when
+the caller's filters are strict enough that too few mutations survive for CNAqc to fit the
+peaks reliably.
+
+The chunks in this section are evaluated only when the somatic call set is present next to
+the caller output; otherwise they are shown but skipped, and the CNAqc columns are absent
+from the QC table further down.
+
+```{r loadmutations, eval = has_somatic}
+mutations <- loadMutationsFromVCF(
+  somatic.fn,
+  sample = tumor_sample,
+  genome = "hg38"
+)
+nrow(mutations)
+head(mutations)
+```
+
+Note that the function applyQCMetrics can take advantage of parallelization
+using the future package. Here we set a multisession plan with 4 workers.
+After the function call we return to the original plan. 
+```{r somaticQC, eval = has_somatic, cache=TRUE}
+oplan <- plan(multisession, workers = 4) # set parallel processing and keep track of the previous settings
+cnv <- cnvstrmliner::applyQCMetrics(
+  cnv,
+  somatic.mutations = mutations,
+  clonal = TRUE, # TRUE is the default anyway
+  calculate_chromosome_scores = TRUE # TRUE is the default anyway
+)
+plan(oplan) # return to the original (probably single thread)
+
+cat(
+  "Peak analysis score: ",
+  cnv@quality$cnaqcobj$peaks_analysis$score
+)
+
+cat(
+  "Peak analysis flag: ",
+  cnv@quality$cnaqcobj$peaks_analysis$QC
+)
+```
+
+The score is essentially 0 and the flag is PASS, i.e. the purity that FACETS fitted for
+this sample is consistent with the VAF distribution of the somatic mutations.
+
+The applyQCMetrics function can take a long time. One can use the parallelization functions as shown above to speed up the process.
+Alternatively set the option calculate_chromosome_scores = FALSE to skip the chromosome level scores and only calculate the overall score.
+
+More detailed information can be obtained from that object if somebody wants to do a more thorough analysis.
+Especially the slot `cnv@quality$cnaqcobj$cna` can provide specific information for each segment.
+The slot `cnv@quality$cnaqcobj$cna` contains more detailed score per chromosome, however the confidence on this score depends on the number of mutations and is
+based on certain, common, karyotypes.
+`cnv@quality$cnaqcobj$peaks_analysis$matches` contains a summary of the different common karyotypes
+`cnv@quality$cnaqcobj$peaks_analysis$general$summary` contains a summary of the different uncommon karyotypes
+
+The segments are also annotated with the flag `cnv.cnaqc.pass` which indicates if the
+segment passed the CNAqc test or not, and `filterLowQualitySegments()` can be used to drop
+the ones that did not.
+
+```{r cnaqcpass, eval = has_somatic}
+table(cnv@segments$cnv.cnaqc.pass, useNA = "ifany")
+```
+
+In addition, we can detect overfragmented chromosomes. 
+Typically, unless there is a chromothripsis event overfragmented chromosomes
+most likely indicate that the segmentation is not very successfull.
+
+```{r overfragmentation_facets}
+cnv <- detectOverfragmentation(cnv, minimum_segments_for_testing = 20)
+cnv@quality$fragmentation$table
+```
+
+
+A summary of the QC metrics can be obtained using the qcTable function which returns a data frame with the main QC metrics for the sample.
+This is useful if multiple samples are being analysed and one wants to compare them.
+
+```{r qctable}
+qc_summary <- qcTable(cnv)
+qc_summary
+```
+
+
+An additional metric of the sample's fragmentation is the conditional entropy.
+When a cohort of samples is used one can use the whole cohort with the function cnvEntropy() to 
+calculate the conditional entropy of all the samples using a common list of shared segments.
+
+To calculate the same metric for a single sample one must first define the segments on the genome.
+In a general case one can use the segments that are predicted by the method as is however this is not 
+very helpful if one wants to perform some comparison with other samples. For that a common set of segments 
+can be defined. For a WES cohort the coordinates of the capture kit are the natural
+choice. `BRCA_XX_01` was captured with the Agilent SureSelect Human All Exon V6 kit and
+that target file ships with the example data, so we can use it directly.
+`cnvEntropy()` accepts either the path of the BED file or an already imported `GRanges`,
+and the two are equivalent. Note that due to the number of regions the entropy
+calculation may take a long time.
+
+```{r entropy}
+exons <- import.bed(bed.file)
+length(exons)
+
+cnvEntropy(cnv, bed.file)
+cnvEntropy(cnv, exons)
+```
+
+Using the capture regions rather than arbitrary windows makes the value comparable across
+samples of the same WES cohort, since every sample is scored over exactly the same
+intervals.
+
+
+
+Everything above used a single FACETS profile. The same functions apply unchanged to
+every other supported caller, because all the parsers return the same `cnvstrml`
+structure. The *Parsing CNV caller outputs* vignette walks through
+Control-FREEC, SCLUST, Sequenza and PureCN on this same sample, and covers
+subclones, chromosome-arm annotation, segment-by-segment comparison and
+cohort-level consensus.
+
+# Notes 
+
+## Utility functions
+
+`cnvstrmliner::mergeSegments()` : merges adjacent segments of a `GRanges` if they have the
+same allele copies. It operates on the `segments` slot and requires the `arm` column, so
+run `addChromosomeAnnotation()` first.
+
+```{r mergesegments}
+cnv.annot <- addChromosomeAnnotation(cnv)
+
+merged <- cnvstrmliner::mergeSegments(cnv.annot@segments)
+length(cnv.annot@segments)
+length(merged)
+```
+
+`cnvstrmliner::findConsensus()`: finds the common regions between multiple CNV objects  
+`cnvstrmliner::addChromosomeAnnotation()`: Adds information about the chromosome arm  
+`cnvstrmliner::detectOverfragmentation()`: Detects if a chromosome arm is overfragmented based on the CNAqc algorithm
+
+## Supporting scripts 
+
+Use the `annotateGenes.R` script to annotate the segments with gene symbols
+
+Use the `addCNAqc.R` to load a CNV object and add the CNAqc information to its quality slot
+
+## Cohort analysis
+
+`cnvEntropy()`, `cnvMetrics()`, `findConsensus()` and `plotCNVFreq()` operate on a list of
+`cnvstrml` objects rather than on a single sample. They are demonstrated in the
+*Parsing CNV caller outputs* vignette, and the agreement metrics themselves in
+*Comparing CNV segmentations*.
+
+## Correcting by ploidy and purity
+
+Given the ploidy of genome and its purity The observed log2 ratios are treated as a mix of some fraction of tumor cells (specified by purity), possibly with altered copy number, and a remainder of normal cells with neutral copy number (specified by ploidy for autosomes) by default, diploid autosomes,
+
+Assuming an initial ploidy the various copy numbers (`copies`) are transformed to logR.
+
+$$
+logR= log2(copies/ploidy)
+$$
+
+However taking the purity (or CCF if we want to be specific for each segment) this transformation becomes
+
+$$
+logR=log2( (1 - ccf) + ccf * copies / ploidy )
+$$
+
+We can reverse that equation and if we know the CCF we can extract the copy numbers and the set CCF to 1 and recalculate the logR~adjusted~.
+
+$$
+logR_{adjusted}=log2( (2^{logR} -(1-ccf))/ccf )
+$$
+
+
+For any given segment we test the above equations.
+
+For each CCF we calculate the logR and then the copy numbers by reversing the logR 
+The logR is the "observed" ratio of coverage in log space
+The adjusted 
+```{r ccf_grid}
+ploidy <- 2 # cnvObj@ploidy
+copies <- seq(0, 6)
+# if we incorporate cff and ploidy
+cat("Ploidy        : ", ploidy, "\n")
+
+mat <- lapply(seq(0.1, 1, 0.1), function(ccf) {
+  r <- list()
+  r["CCF"] <- ccf
+  lrr <- log2((1 - ccf) + ccf * copies / ploidy)
+  # get back the corrected of copies
+  rev_copies <- (2^lrr - (1 - ccf)) * ploidy / ccf
+  # recalculate the lrr as if the ccf is 1
+  final_lrr <- log2(rev_copies / ploidy)
+
+  r["Real Copies"] <- list(copies)
+  r["Reversed calculated"] <- list(round(rev_copies, 0))
+  r["logR copies"] <- list(round(lrr, 2))
+  r["Adjusted logR (by ploidy)"] <- list(round(final_lrr, 2))
+
+  # OR
+
+  final_lrr2 <- log2((2^lrr - (1 - ccf)) / ccf)
+  r["Adjusted logR (using CCF)"] <- list(round(final_lrr2, 2))
+  dplyr::bind_rows(r)
+}) %>% dplyr::bind_rows()
+
+DT::datatable(mat) %>%
+  DT::formatRound(c("Real Copies", "Reversed calculated"), 0) %>%
+  DT::formatRound(c("CCF"), 1)
+```
+
+we can apply this to a cnvstrmliner object
+
+```{r adjustlrr}
+adjustLRR <- function(ploidy, ccf, copies) {
+  lrr <- log2((1 - ccf) + ccf * copies / ploidy)
+  rev_copies <- (2^lrr - (1 - ccf)) * ploidy / ccf
+  log2(rev_copies / ploidy)
+}
+
+adjusted.lrr <- adjustLRR(
+  ploidy = cnv@ploidy,
+  ccf = cnv@segments$cnv.ccf,
+  copies = cnv@segments$total.allele.copies
+)
+
+head(data.frame(
+  copies = cnv@segments$total.allele.copies,
+  ccf = round(cnv@segments$cnv.ccf, 3),
+  observed.lrr = round(cnv@segments$cnv.lrr, 3),
+  adjusted.lrr = round(adjusted.lrr, 3)
+))
+```
+
+## Logging 
+
+The package is using `r CRANpkg("logger")` for logging purposes.
+The logger namespace used for this package is 'cnvstrmliner' for the core functions, 'parser' for the CNV caller parser, 'applyqcmetrics' for the QC metrics 
+One can change the level of logging by adding the line `logger::log_threshold(DEBUG,namespace = 'parser')` to show debugging information (or WARN, INFO for higher level annotation)
+for the parser actions.
+Each logger can be set independently. e.g
+
+```
+logger::log_threshold(DEBUG,namespace = 'parser')
+logger::log_threshold(WARN,namespace = 'cnvstmliner')
+```
+
+## Parallelization
+
+The package is using `r CRANpkg("future")` and `r CRANpkg("future.apply")` whenever possible
+To set the number of cores used for parallel processes set the future plan like:
+
+```
+oplan <- plan(multisession, workers = 6) # set a parallel processing with 6 cores and keep track of the previous settings for parallelization
+# calls to functions of cnvstrmliner
+#
+plan(oplan) # return to the original (probably single thread)
+```
+
+# Session info
+
+```{r sessionInfo, echo = FALSE}
+sessionInfo()
+```
+
+# References {.unnumbered}

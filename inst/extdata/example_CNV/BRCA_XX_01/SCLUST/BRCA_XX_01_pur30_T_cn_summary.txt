@@ -1,0 +1,2 @@
+sample_name	purity	ploidy	fraction_subclonal_cn	sex_estimated	status	fraction_inconsistent_segs
+BRCA_XX_01_pur30_T	0.29	2.35993	0.0270152	f	optimum	0.0470337

@@ -1,0 +1,2 @@
+"Sampleid","Purity","Ploidy","Sex","Contamination","Flagged","Failed","Curated","Comment"
+"BRCA_XX_01_pur30_T",0.54,2.15486059344694,"F",0.0481441639350445,TRUE,FALSE,FALSE,"POOR GOF (73.4%);POTENTIAL SAMPLE CONTAMINATION"

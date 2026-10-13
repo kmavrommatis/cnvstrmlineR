@@ -1,0 +1,616 @@
+---
+title: "Parsing CNV caller outputs"
+author:
+- name: Konstantinos Mavrommatis
+  affiliation: Bristol Myers Squibb
+  email: konstantinos.mavrommatis@bms.com
+package: cnvstrmliner
+output:
+  BiocStyle::html_document:
+    toc_float: true
+    code_folding: show
+abstract: |
+  Every copy-number caller writes its results in its own layout, often spread
+  over several files and with differently named fields. `cnvstrmliner` provides
+  one parser per supported caller, all returning the same `cnvstrml` object.
+  This vignette runs five callers -- FACETS, SCLUST, PureCN, Sequenza and
+  Control-FREEC -- over the same whole-exome sample, shows the quirks of each
+  output, and then uses the common representation to plot the callers side by
+  side, build a consensus and compare a parameter sweep at cohort level.
+vignette: |
+  %\VignetteIndexEntry{Parsing CNV caller outputs}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  crop = NULL,
+  cache = TRUE,
+  fig.width = 10,
+  fig.height = 4
+)
+```
+
+```{r setup, message = FALSE}
+library(cnvstrmliner)
+library(logger)
+library(GenomicRanges)
+library(ggplot2)
+library(DT)
+log_threshold(level = WARN, namespace = "cnvstrmliner")
+```
+
+# Introduction
+
+The proliferation of Next-Generation Sequencing (NGS) tools for predicting 
+Copy Number Aberrations (CNAs) has led to a significant data integration 
+challenge in bioinformatics. Each application, while serving the same core purpose, 
+generates results in a unique output format, often spread across multiple files. 
+Furthermore, the specific metrics and fields reported—such as segment start/end positions, 
+log-ratio values, and associated p-values—are frequently named differently or 
+are not uniformly present across all tool outputs. 
+This lack of standardization creates substantial overhead for researchers, 
+who must write custom parsing scripts for every new tool, leading to complex 
+and error-prone downstream analysis. It is exceptionally difficult to compare 
+results across different methods, integrate them into common analysis pipelines, 
+or use them with existing visualization and interpretation software, 
+even when using semi-standard formats like SEG or VCF which haven't achieved universal adoption.
+
+A dedicated package capable of reading the diverse outputs of CNA prediction tools 
+and translating them into a single, common, standardized format is crucial for 
+streamlining genomic data analysis. Such a package would significantly reduce 
+the need for custom scripting, allowing researchers to focus on biological 
+interpretation rather than data wrangling. By providing a consistent data 
+structure, it would immediately enable method comparison, consensus calling, 
+and seamless integration with downstream analysis and visualization tools, 
+irrespective of the initial prediction method. This unified approach promotes 
+reproducibility and interoperability across different studies and laboratories, 
+ultimately accelerating the pace of discovery in cancer genomics and other fields 
+relying on CNA analysis.
+
+`cnvstrmliner` is a package that tries to assume the role of this middle layer
+that is capable of parsing multiple output formats and provide a single uniform one 
+using standard Bioconductor objects.
+Furthermore, some additional functionality is added to facilitate the comparisons and 
+QC.
+
+## The example dataset
+
+Every example in this vignette uses a single sample, **`BRCA_XX_01_pur30_T`**, that
+ships with the package under `extdata/example_CNV/BRCA_XX_01`. It is a simulated
+breast tumour / matched normal pair diluted to a nominal 30% tumour purity, processed
+through five different CNV callers. Because all the results describe the *same*
+underlying sample, it is well suited for showing both how the individual
+parsers work and how the results of different callers can be compared, merged and
+plotted side by side.
+
+The sample is **whole-exome (WES)**, captured with the Agilent SureSelect Human All Exon
+V6 kit; the target coordinates ship next to the caller output as
+`S07604514_Regions_v6_hg38_Targets.bed`. This is worth keeping in mind when reading the
+plots below: the callers only observe the captured intervals, so breakpoints are pinned to
+target boundaries, segments carry far fewer markers than they would in WGS, and long
+stretches between targets are interpolated rather than measured. It is also part of why
+the callers disagree as much as they do on this sample.
+
+```{r datadir}
+root <- system.file("extdata/example_CNV/BRCA_XX_01", package = "cnvstrmliner")
+list.dirs(root, recursive = FALSE, full.names = FALSE)
+```
+
+The `getSupportedMethods()` function lists the callers that the package knows how to read.
+
+```{r supported}
+getSupportedMethods()
+```
+
+Typically, for each supported caller the function `loadCNV()` can be used to load data,
+using the `cnv.method` argument to specify the caller.
+There is also a `parse<CALLER>` function that loads the data by parsing the usual files
+produced by the caller (in fact `loadCNV()` is a dispatch function that calls the
+appropriate `parse<CALLER>` function).
+
+The result is a `cnvstrml` object that contains several slots with related information.
+Notably, `cnvObj@segments` contains a `GRanges` object with all the segments and their
+annotation.
+
+The annotation of this `GRanges` object is uniform and contains the `total.allele.copies`,
+`major.allele.copies`, `minor.allele.copies` etc as well as the `ccf` and `cf` of each
+segment. If the method provides subclones (e.g. Battenberg or SCLUST) it also provides the
+copies of Clone1 and Clone2.
+
+In all cases the column `total.allele.copies` contains the total copies in a segment,
+`major.allele.copies` the major allele copies and 
+`minor.allele.copies` contains the minor allele copies
+(`total.allele.copies = minor.allele.copies + major.allele.copies`).
+`cnv.loh` is a flag (TRUE/FALSE) indicating if a segment has lost its heterozygosity. 
+In combination with `cnv.annotation`, which contains the type of event (NEUT, AMP, DEL, LOH etc),
+it provides a uniform way to annotate segments.
+Additionally, when the method provides it, `cnv.cf` and `cnv.ccf` contain the cell fraction (purity)
+and cancer cell fraction respectively.
+Finally, if the method provides it, the logR of the segment is stored in the `cnv.lrr` column.
+After QC metrics have been applied the segments also contain the `cnv.cnaqc.pass` flag
+indicating if the segment passed the CNAqc test or not.
+
+Other slots include `cnvObj@purity` with the purity estimated by the method, 
+`cnvObj@ploidy` with the ploidy (which can be a float number) and 
+`cnvObj@effective_ploidy` with the ploidy of the majority of the genome (integer).
+
+
+# Load and parse data from various callers
+
+## FACETS
+
+FACETS reports its segmentation in a single VCF file, with purity and ploidy stored in the
+VCF header. `parseFACETS()` accepts either that VCF (plain, bgzipped or `.bgz`) or a
+`data.frame` with the segment table.
+
+```{r facets}
+facets.file <- file.path(
+  root, "FACETS",
+  "BRCA_XX_01_normal_wg-BRCA_XX_01_pur30_T.vcf.gz"
+)
+
+facets <- parseFACETS(facets.file, sample = "BRCA_XX_01_pur30_T", genome = "hg38")
+facets
+```
+
+Printing the object gives the purity/ploidy estimated by the caller, the inferred sex and
+whatever quality information could be recovered from the caller's own output. The
+harmonised segments live in the `segments` slot:
+
+```{r facets_segments}
+head(facets@segments, 3)
+```
+
+Note that alongside the columns produced by FACETS itself (`TCN_EM`, `LCN_EM`, `CF_EM`, ...)
+the parser has added the uniform `total.allele.copies` / `major.allele.copies` /
+`minor.allele.copies` / `cnv.annotation` / `cnv.loh` / `cnv.ccf` set that every other
+parser in the package produces as well.
+
+### Plotting a single sample
+
+`plotSegments()` gives a visual overview of the genome. Segments are coloured by
+`cnv.annotation` and the dotted horizontal line marks the effective ploidy of the sample.
+
+```{r facets_plot}
+plotSegments(facets)
+```
+
+The same function accepts a number of arguments that change what is shown.
+`chromosomes` restricts the plot to a subset of the genome, and `main` / `subtitle`
+override the automatically generated labels.
+
+```{r facets_plot_chrom}
+#| fig.width: 7
+plotSegments(
+  facets,
+  chromosomes = c("chr1", "chr6", "chr16"),
+  main = "BRCA_XX_01 - FACETS",
+  subtitle = "Chromosomes 1, 6 and 16"
+)
+```
+
+`max.copies` caps the y axis (the underlying values are not modified, only the
+visualisation), which is useful when a handful of high-level amplifications would
+otherwise flatten the rest of the profile. `tiny.segment.frac` controls the size below
+which a segment is drawn as a diamond marker rather than a rectangle, so that focal events
+remain visible at genome scale.
+
+```{r facets_plot_maxcopies}
+plotSegments(facets, max.copies = 10, tiny.segment.frac = 0.002)
+```
+
+Finally, `highlightgr` shades a set of regions of interest across the plot. It accepts
+either a plain `GRanges`
+
+A single gene locus is only a few tens of kilobases wide, which at chromosome scale is
+thinner than the line used to draw it. Padding each region by 1 Mb on either side makes
+the shaded band wide enough to see without moving it away from the gene.
+
+```{r facets_plot_highlight}
+# ERBB2 and TP53 loci (hg38), padded by 1 Mb upstream and downstream so that the
+# highlighted bands are visible at chromosome scale.
+pad <- 1e6
+
+roi <- GRanges(
+  seqnames = c("chr17", "chr17"),
+  ranges = IRanges(
+    start = c(39687914, 7668402) - pad,
+    end   = c(39730426, 7687550) + pad
+  ),
+  gene = c("ERBB2", "TP53")
+)
+
+plotSegments(facets, highlightgr = roi, chromosomes = "chr17")
+```
+
+`highlightgr` also accepts another `cnvstrml` object, in which case the segments of that
+object are shaded behind the profile of the first one — a quick way of overlaying the
+calls of a second method.
+
+
+## SCLUST
+
+SCLUST distributes its results over several files (`*_cn_summary.txt`,
+`*_allelic_states.txt`, `*_subclonal_cn.txt`, ...). Only one of them has to be given:
+the parser derives the common stem and collects all the files it needs.
+
+`r CRANpkg("logger")` can be used to define the level of logging information one wants to see while
+this happens.
+
+```{r sclust}
+# show what the parser is doing
+logger::log_threshold(logger::DEBUG, namespace = "parser")
+
+sclust.file <- file.path(root, "SCLUST", "BRCA_XX_01_pur30_T_cn_summary.txt")
+
+sclust <- parseSCLUST(sclust.file, genome = "hg38")
+
+# back to a quiet threshold
+logger::log_threshold(logger::WARN, namespace = "parser")
+
+sclust
+```
+
+The sample name did not have to be supplied here — SCLUST records it in its summary file
+and the parser picks it up.
+
+### Subclones
+
+SCLUST may report two subclones per segment. `updateSCLUSTClone()` builds a new
+`cnvstrml` object in which the copy numbers of the requested clone replace the consensus
+ones, so the two clonal solutions can be inspected as if they were separate samples.
+
+```{r sclust_clones}
+#| fig.height: 8
+cloneA <- updateSCLUSTClone(sclust, clone = "Clone1")
+cloneB <- updateSCLUSTClone(sclust, clone = "Clone2")
+
+plotSegments(list(sclust, cloneA, cloneB))
+```
+
+When `plotSegments()` is given a *list* of objects it stacks the panels and collects a
+single shared legend. With three panels or fewer each panel keeps its own title and
+subtitle; with more than three the titles are replaced by a compact
+`sample` / `method (purity)` label in the left gutter (see the cross-caller comparison
+further down).
+
+### Chromosome arm annotation
+
+`addChromosomeAnnotation()` adds the chromosome arm to every segment and splits any
+segment that spans a centromere into its p and q parts. Telomeres are typically not
+covered by the CNV algorithms, so the annotated object may contain slightly more segments
+than the original one.
+
+```{r addchromosomeannotation}
+sclust.annot <- addChromosomeAnnotation(sclust)
+
+table(sclust.annot@segments$arm)
+```
+
+### Comparing two objects segment by segment
+
+`compareSegmentStatus()` intersects the segments of two `cnvstrml` objects and reports,
+for every overlapping interval, the status, the total copy number and the CCF of each
+side. Here we compare the two SCLUST subclones.
+
+```{r comparesegments}
+comp <- compareSegmentStatus(cloneA, cloneB)
+
+head(comp$table)
+```
+
+The last three columns hold the flags `status`, `cnv` and `ccf`, indicating whether the two
+segments agree. For the last two columns a value of `SAME` means that although the total
+copies and/or the CCF are identical, the *status* is not — e.g.
+
+```
+chr1  50596099  85708305   NEUT   HETDEL   2   2   0.25   0.25   FP   SAME   SAME
+```
+
+The `summary` and `stats` elements aggregate the same information per karyotype pair and
+per status:
+
+```{r comparesegments_stats}
+comp$stats
+```
+
+
+## PureCN
+
+PureCN is popular because it can be run against a panel of normals and therefore works
+with unmatched tumour samples. Like SCLUST it writes several files sharing a common stem
+(`*.csv`, `*_loh.csv`, `*_variants.csv`, `*_genes.csv`), and again a single one of them is
+enough to get started.
+
+```{r purecn}
+purecn.file <- file.path(root, "PureCN_TCGAref", "BRCA_XX_01_pur30_T_loh.csv")
+
+purecn <- parsePureCN(purecn.file, genome = "hg38")
+purecn
+```
+
+PureCN reports non-integer copy numbers, so the parser warns that the CNV annotations were
+derived after rounding; the original `C` and `M` values are kept in the segment metadata
+for reference.
+
+```{r purecn_plot}
+plotSegments(purecn)
+```
+
+`summaryTable()` aggregates the segments by karyotype and event type. It can be run at the
+genome, chromosome or arm level.
+
+```{r purecn_summary}
+summaryTable(purecn, level = "genome")
+```
+
+
+## Sequenza
+
+Sequenza also writes a directory of files around a common stem; `parseSequenza()` reads
+the segments together with the run information, the confidence intervals of the
+cellularity/ploidy grid search and the alternative solutions it considered.
+
+```{r sequenza}
+sequenza.file <- file.path(root, "Sequenza", "BRCA_XX_01_pur30_T_segments.txt")
+
+sequenza <- parseSequenza(sequenza.file, genome = "hg38")
+sequenza
+```
+
+This particular run is heavily fragmented compared with the other callers, which makes it
+a good illustration of the fragmentation test below.
+
+```{r sequenza_plot}
+plotSegments(sequenza)
+```
+
+### Chromosome overfragmentation
+
+Following the example of CNAqc (which is embedded in the package) one can compute a
+p-value for each chromosome arm and test whether the arm is overfragmented.
+This version of the function does not require initialising a CNAqc object and allows a
+short segment to be defined by its size rather than as a percentage of the chromosome arm.
+
+```{r overfragmentation}
+sequenza <- detectOverfragmentation(sequenza)
+
+subset(sequenza@quality$fragmentation$table, significant == TRUE) %>%
+  as.data.frame() %>%
+  DT::datatable()
+```
+
+Passing `arm_percentage_cutoff` as an absolute number of base pairs counts only segments
+shorter than that as "short", which usually removes most of the significant arms.
+
+```{r overfragmentation_bp}
+sequenza <- detectOverfragmentation(sequenza, arm_percentage_cutoff = 30000000)
+
+subset(sequenza@quality$fragmentation$table, significant == TRUE) %>%
+  as.data.frame() %>%
+  DT::datatable()
+```
+
+
+## Control-FREEC
+
+Control-FREEC results are distributed over multiple files as well (`*_CNVs`,
+`*_info.txt`, `*_ratio.txt`, `*_BAF.txt`). `cnvstrmliner` finds all the necessary files
+and compiles the final result: only one of them has to be named. The example data holds
+the tumour/normal run of the sample.
+
+```{r cfreec}
+freec.file <- file.path(
+  root, "ControlFREEC_tn",
+  "BRCA_XX_01_pur30_T.mpileup.gz_ploidy2_CNVs"
+)
+
+freec <- parseCfreec(freec.file, sample = "BRCA_XX_01_pur30_T", genome = "hg38")
+freec
+```
+
+Control-FREEC output contains only the regions of the chromosome that deviate from
+neutral. As a result the parser adds the missing segments, but issues a warning to inform
+the user about this. It adds the column `cnv.fill` to indicate that a segment was added
+through that process.
+
+```{r cfreec_plot}
+plotSegments(freec)
+```
+
+
+## Reading everything through a single entry point
+
+`loadCNV()` (an alias of `parseCNV()`) dispatches to the right parser based on
+`cnv.method`, which makes it easy to drive the package from a manifest. The method name is
+matched case-insensitively and several aliases are accepted (`freec`, `controlfreec`,
+`control-freec`, ...).
+
+```{r loadcnv}
+manifest <- data.frame(
+  method = c("FACETS", "SCLUST", "PureCN", "Sequenza", "FREEC"),
+  file = c(
+    facets.file,
+    sclust.file,
+    purecn.file,
+    sequenza.file,
+    freec.file
+  ),
+  stringsAsFactors = FALSE
+)
+
+callers <- mapply(
+  function(m, f) {
+    obj <- loadCNV(f, cnv.method = m, sample = "BRCA_XX_01_pur30_T", genome = "hg38")
+    obj@sample <- "BRCA_XX_01_pur30_T"
+    obj
+  },
+  manifest$method, manifest$file,
+  SIMPLIFY = FALSE
+)
+
+data.frame(
+  method = sapply(callers, function(x) x@method),
+  purity = sapply(callers, function(x) round(x@purity, 2)),
+  ploidy = sapply(callers, function(x) round(x@ploidy, 2)),
+  segments = sapply(callers, function(x) length(x@segments))
+)
+```
+
+Besides the caller-specific parsers, the package can also read the generic interchange
+formats (`parseSEG()`, `parseVCF()`, `parseTSV()`) and can write the harmonised object
+back out with `saveSEG()`, `saveVCF()`, `exportGISTIC()` or `saveAnnotSV()`.
+
+
+# Comparing all callers on the same sample
+
+Because every parser returns the same structure, the five results can simply be put in a
+list and plotted together. With more than three panels `plotSegments()` drops the
+per-panel titles and identifies each track by a `sample` / `method (purity)` label in the
+left gutter; `sample.label.width` controls how aggressively long sample names are
+truncated.
+
+```{r all_callers}
+#| fig.height: 11
+plotSegments(
+  callers,
+  main = "BRCA_XX_01_pur30_T across five callers",
+  sample.label.width = 20
+)
+```
+
+The differences are striking even though the input data are identical: the estimated
+purity ranges from 0.29 to 0.54 and the number of segments spans an order of magnitude.
+
+`compareSegmentStatus()` quantifies that impression for any pair of callers.
+
+```{r caller_agreement}
+agreement <- lapply(callers[-1], function(x) {
+  compareSegmentStatus(callers$FACETS, x)$stats %>%
+    dplyr::mutate(method = x@method)
+}) %>%
+  dplyr::bind_rows()
+
+agreement
+```
+
+
+# Cohort level plotting
+
+`plotCNVFreq()` summarises a *collection* of segmentations as the frequency of gains and
+losses along the genome. It expects a consensus object built by `findConsensus()`, which
+first has to be given a list of objects that all cover the genome — `fillGaps()` inserts
+the neutral stretches that a caller may have left out.
+
+`findConsensus()` supports two modes, and the distinction matters:
+
+* `ignore.samples = FALSE` — all the objects describe the **same** sample (typically the
+  same tumour run through different callers). The list has to be *named*, and those names
+  become the column names of the consensus matrix.
+* `ignore.samples = TRUE` — the objects are treated as **different** samples, i.e. a
+  cohort. Column names are taken from the `sample` slot of each object.
+
+## Consensus of the five callers
+
+```{r consensus}
+callers.filled <- lapply(callers, fillGaps)
+
+consensus <- findConsensus(callers.filled, ignore.samples = FALSE)
+consensus
+```
+
+The consensus segments carry one column per caller plus a set of summary statistics
+(`stats.mean`, `stats.median`, `stats.sd`, `stats.majority`, `stats.majority.count`,
+`stats.count`).
+
+```{r consensus_table}
+head(as.data.frame(mcols(consensus@segments)), 5)
+```
+
+```{r consensus_plot}
+#| fig.height: 4
+plotCNVFreq(
+  consensus,
+  main = "BRCA_XX_01_pur30_T",
+  subtitle = "Fraction of callers reporting a gain / loss"
+)
+```
+
+Bars above the axis count gains, bars below count losses, and the two shades distinguish
+the p and q arms. By default the frequencies are computed relative to the median copy
+number of each column (`ploidy = TRUE`); with `ploidy = FALSE` they are computed relative
+to an absolute copy number of 2.
+
+```{r consensus_plot_absolute}
+#| fig.height: 4
+plotCNVFreq(consensus, ploidy = FALSE, main = "Relative to CN = 2")
+```
+
+## A cohort built from a parameter sweep
+
+The FACETS directory of the example data also contains the output of a grid search over
+the `snp.nbhd` and `cval` segmentation parameters, one VCF per combination. Loading those
+as a cohort shows which events are robust to the segmentation settings and which are an
+artefact of a particular choice.
+
+```{r sweep_load}
+sweep.files <- list.files(
+  file.path(root, "FACETS"),
+  pattern = "csv_[0-9]+-[0-9]+\\.vcf\\.gz$",
+  full.names = TRUE
+)
+
+# a subset is enough for the vignette
+sweep.files <- sweep.files[1:8]
+
+sweep <- lapply(sweep.files, function(f) {
+  tag <- sub("\\.vcf\\.gz$", "", sub(".*csv_", "", basename(f)))
+  obj <- parseFACETS(f, sample = paste0("nbhd-cval_", tag), genome = "hg38")
+  fillGaps(obj)
+})
+
+data.frame(
+  run = sapply(sweep, function(x) x@sample),
+  purity = sapply(sweep, function(x) round(x@purity, 2)),
+  segments = sapply(sweep, function(x) length(x@segments))
+)
+```
+
+Here the objects deliberately carry different sample names, so the cohort mode of
+`findConsensus()` is the right one.
+
+```{r sweep_consensus}
+sweep.consensus <- findConsensus(sweep, ignore.samples = TRUE)
+sweep.consensus
+```
+
+```{r sweep_plot}
+#| fig.height: 4
+plotCNVFreq(
+  sweep.consensus,
+  main = "FACETS parameter sweep",
+  subtitle = "BRCA_XX_01_pur30_T, 8 segmentation settings"
+)
+```
+
+The large arm-level events are recovered by every setting, while the focal calls appear in
+only a fraction of the runs — exactly the kind of stability information that is lost when
+a single parameter combination is reported on its own.
+
+The same list can of course also be stacked with `plotSegments()`:
+
+```{r sweep_segments}
+#| fig.height: 11
+plotSegments(sweep[1:5], main = "FACETS segmentation settings")
+```
+
+
+# Session info
+
+```{r sessionInfo, echo = FALSE}
+sessionInfo()
+```

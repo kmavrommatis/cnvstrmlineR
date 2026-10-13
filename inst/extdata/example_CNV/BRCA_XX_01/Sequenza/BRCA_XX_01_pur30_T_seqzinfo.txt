@@ -1,0 +1,2 @@
+sample	normalization	assembly	breaks.method	gamma	kmin	gamma.pcf	kmin.pcf	ratio.priotiry	ploidy	purity
+BRCA_XX_01_pur30_T	median	hg38	het	80	10	140	40	FALSE	2	0.3

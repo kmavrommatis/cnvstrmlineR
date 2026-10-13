@@ -1,0 +1,49 @@
+# Extra exclusions applied ONLY to the public release snapshot.
+#
+# This list is ADDITIVE on top of .gitignore: release_public.sh runs
+# `git add .` first (which already honours .gitignore), then strips
+# everything matched here. Do not duplicate .gitignore entries.
+#
+# NOTE: these are git *pathspecs*, not gitignore patterns. `*` matches
+# across `/`, and there is no `!` negation. One pattern per line.
+
+# --- Internal build / release tooling -------------------------------
+docker/
+scripts/
+release_public.sh
+
+# --- Editor / OS cruft and local backups ----------------------------
+*.bak
+.DS_Store
+._*
+
+# --- Example data: publish ONLY BRCA_XX_01 --------------------------
+# The other example_CNV subdirectories have since been deleted from the
+# working tree outright, so these are belt-and-braces: they keep the
+# fixtures out of the public snapshot if any are ever restored locally.
+inst/extdata/example_CNV/clonecna/
+inst/extdata/example_CNV/controlfreec_tn/
+inst/extdata/example_CNV/facets/
+inst/extdata/example_CNV/purecn/
+inst/extdata/example_CNV/sclust/
+inst/extdata/example_CNV/sequenza/
+
+# --- Internal helper script -----------------------------------------
+# Internal driver script: carries internal specimen IDs, local absolute
+# paths and an internal git host URL. Documented in vignettes/mfacets.Rmd.
+inst/extdata/mfacets.R
+
+# --- Internal-only vignettes ----------------------------------------
+# mfacets.Rmd documents the internal mFACETS workflow and pairs with the
+# excluded inst/extdata/mfacets.R.
+vignettes/mfacets.Rmd
+# annotation.Rmd still system.file()s the deleted EA facets fixtures.
+# Drop this line once it is repointed at BRCA_XX_01.
+vignettes/annotation.Rmd
+
+# --- Stale rendered vignette ----------------------------------------
+# introduction.html is knitted from an older revision that still used the
+# EA fixtures (18 residual EA* references) and its figures may carry the
+# same sample names. Drop until re-knitted from the BRCA_XX_01 source.
+vignettes/introduction.html
+vignettes/introduction_files/

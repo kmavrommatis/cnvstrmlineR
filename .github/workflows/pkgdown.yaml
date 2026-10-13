@@ -1,0 +1,70 @@
+# Build the pkgdown site and publish it to GitHub Pages.
+#
+# Settings > Pages > Source must be "GitHub Actions", NOT "Deploy from a
+# branch". Branch deployment invokes GitHub's own internal
+# pages-build-deployment workflow; this path does the deploying itself, so no
+# gh-pages branch is created or needed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+name: pkgdown
+
+permissions: read-all
+
+# Allow one concurrent deployment; never cancel a run mid-deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: r-lib/actions/setup-pandoc@v2
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      # local::. resolves everything in DESCRIPTION: the Bioconductor
+      # imports, and CNAqc via the `Remotes:` field (it is GitHub-only and
+      # not on CRAN or Bioconductor).
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          extra-packages: |
+            any::pkgdown
+            local::.
+          needs: website
+
+      - name: Build site
+        run: pkgdown::build_site_github_pages(new_process = FALSE, install = FALSE)
+        shell: Rscript {0}
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs
+
+  # Deploy only for real pushes/releases. Pull requests build the site as a
+  # check that the vignettes still knit, but must not publish.
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
